@@ -27,6 +27,18 @@ class StreamDiffusionConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
 
     supports_lora = True
+    supports_vace = True
+
+    # Override base vace_context_scale to attach component="vace" — this is what
+    # triggers the VACE toggle + scale slider in the configSchema rendering path.
+    # Without this the toggle only appears in the legacy/no-schema branch.
+    vace_context_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="ControlNet conditioning scale (0.0 = no conditioning, 2.0 = maximum)",
+        json_schema_extra=ui_field_config(order=0, component="vace"),
+    )
 
     # ========================================
     # Model Configuration
@@ -47,22 +59,21 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
 
+    controlnet_model_id: str = Field(
+        default="https://huggingface.co/thibaud/controlnet-sd21/resolve/main/control_v11p_sd21_depth.safetensors",
+        description="HuggingFace model ID or local path for ControlNet (empty = disabled). Must be compatible with the base model.",
+        json_schema_extra=ui_field_config(order=3, label="ControlNet Model", is_load_param=True),
+    )
+
     # ========================================
     # Generation Parameters
     # ========================================
+    # Note: prompts array is handled by Scope's base when supports_prompts = True
 
-    prompt: str = Field(
-        default="Laid down before the gates of Heaven",
-        max_length=5000,
-        description="Generation prompt",
-        json_schema_extra=ui_field_config(order=10, label="Prompt"),
-    )
-
-    negative_prompt: str = Field(
-        default="Deformed, ugly, bad anatomy",
-        max_length=5000,
-        description="Negative prompt",
-        json_schema_extra=ui_field_config(order=11, label="Negative Prompt"),
+    prompt_interpolation_method: Literal["linear", "slerp"] = Field(
+        default="linear",
+        description="Method for blending multiple prompts spatially",
+        json_schema_extra=ui_field_config(order=10, label="Blend Method"),
     )
 
     seed: int = Field(
@@ -157,12 +168,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
         default=False,
         description="Use last frame as input for the next generation",
         json_schema_extra=ui_field_config(order=49, label="Image Loopback"),
-    )
-
-    prompt_weighting: bool = Field(
-        default=True,
-        description="Enable advanced prompt weighting with Compel",
-        json_schema_extra=ui_field_config(order=50, label="Prompt Weighting"),
     )
 
     # Resolution settings (can be overridden at runtime)

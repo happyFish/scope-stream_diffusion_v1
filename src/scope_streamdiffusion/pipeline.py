@@ -1,12 +1,15 @@
 """StreamDiffusion pipeline implementation for Scope."""
 
+import json
+import os
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
 import numpy as np
 import PIL.Image
-from compel import Compel
 from diffusers import (
+    ControlNetModel,
     DiffusionPipeline,
     LCMScheduler,
     StableDiffusionXLPipeline,
@@ -16,6 +19,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
     retrieve_latents,
 )
 from scope.core.pipelines.interface import Pipeline, Requirements
+from scope.core.pipelines.blending import EmbeddingBlender, parse_transition_config
+from scope.core.pipelines.wan2_1.vace import VACEEnabledPipeline
 
 from .schema import StreamDiffusionConfig
 
@@ -44,7 +49,7 @@ class SimilarImageFilter:
         return image_tensor
 
 
-class StreamDiffusionPipeline(Pipeline):
+class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
     """StreamDiffusion pipeline for real-time Stable Diffusion generation."""
 
     @classmethod
@@ -57,6 +62,7 @@ class StreamDiffusionPipeline(Pipeline):
         device: Optional[torch.device] = None,
         model_id: str = "stabilityai/sd-turbo",
         torch_dtype: torch.dtype = torch.float16,
+        controlnet_model_id: str = "",
         **kwargs,  # noqa: ARG002
     ) -> None:
         """Initialize the StreamDiffusion pipeline.
@@ -65,6 +71,7 @@ class StreamDiffusionPipeline(Pipeline):
             device: Torch device to use
             model_id: Model ID or path to load
             torch_dtype: Data type for tensors
+            controlnet_model_id: HuggingFace model ID or local path for ControlNet (empty = disabled)
         """
         self.device = (
             device
@@ -100,36 +107,29 @@ class StreamDiffusionPipeline(Pipeline):
             self.pipe.vae_scale_factor
         )
 
-        # Setup Compel for prompt weighting
-        tokenizers = (
-            [self.pipe.tokenizer, self.pipe.tokenizer_2]
-            if self.sdxl
-            else [self.pipe.tokenizer]
-        )
-        text_encoders = (
-            [self.pipe.text_encoder, self.pipe.text_encoder_2]
-            if self.sdxl
-            else [self.pipe.text_encoder]
-        )
-        requires_pooled = [False, True] if self.sdxl else None
-        self.compel_proc = Compel(
-            tokenizer=tokenizers,
-            text_encoder=text_encoders,
-            requires_pooled=requires_pooled,
-            truncate_long_prompts=False,
+        # Setup embedding blender for prompt weighting and interpolation
+        self.embedding_blender = EmbeddingBlender(
+            device=self.device,
+            dtype=self.dtype,
         )
 
         # State that will be set during runtime
         self.generator = torch.Generator(device=self.device)
+        self._previous_prompt_embeddings = None
         self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.inference_time_ema = 0
 
         # ControlNet support
         self.controlnet = None
-        self.controlnet_pipeline = None
         self.controlnet_input = None
         self.controlnet_conditioning_scale = 1.0
+
+        if controlnet_model_id:
+            print(f"Loading ControlNet: {controlnet_model_id}")
+            self.controlnet = self._load_controlnet(controlnet_model_id).to(self.device)
+            self.controlnet.eval()
+            print("ControlNet loaded")
 
         # Runtime state (will be set from kwargs in __call__)
         self.width = 512
@@ -149,6 +149,113 @@ class StreamDiffusionPipeline(Pipeline):
         self.similar_image_filter = False
 
         print("StreamDiffusion pipeline initialized")
+
+    def _load_controlnet(self, model_id: str) -> ControlNetModel:
+        """Load a ControlNet model, downloading via Scope's infrastructure if needed.
+
+        Accepts:
+          - HuggingFace URL: https://huggingface.co/{repo}/{resolve|blob}/{rev}/{file}
+          - Local .safetensors / .ckpt / .bin file path
+          - Full diffusers repo ID: org/repo (must have config.json)
+        """
+        from scope.core.config import get_models_dir
+        from scope.server.download_models import download_hf_repo
+
+        hf_url = re.match(
+            r"https://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+)",
+            model_id,
+        )
+        if hf_url:
+            repo_id, revision, filename = (
+                hf_url.group(1),
+                hf_url.group(2),
+                hf_url.group(3),
+            )
+            local_dir = get_models_dir() / repo_id.split("/")[-1]
+            local_path = local_dir / filename
+            if not local_path.exists():
+                print(f"  Downloading {filename} from {repo_id}")
+                download_hf_repo(
+                    repo_id=repo_id,
+                    local_dir=local_dir,
+                    allow_patterns=[filename],
+                    pipeline_id="streamdiffusion",
+                )
+            print(f"  Loaded from: {local_path}")
+            return self._from_single_file_with_config(local_path, filename)
+
+        if model_id.endswith((".safetensors", ".ckpt", ".bin")):
+            return self._from_single_file_with_config(
+                model_id, os.path.basename(model_id)
+            )
+
+        return ControlNetModel.from_pretrained(model_id, torch_dtype=self.dtype)
+
+    def _from_single_file_with_config(
+        self, local_path, filename: str
+    ) -> ControlNetModel:
+        """Load a single-file ControlNet checkpoint, writing a config.json alongside it
+        so diffusers doesn't try to fetch one from stable-diffusion-v1-5 on HuggingFace."""
+        from pathlib import Path
+
+        local_path = Path(local_path)
+        config_path = local_path.parent / "config.json"
+
+        if not config_path.exists():
+            # Detect SD version from filename; default to SD 2.1 if ambiguous
+            name_lower = filename.lower()
+            is_sd2 = "sd21" in name_lower or "sd2" in name_lower or "v2" in name_lower
+            is_sd1 = "sd15" in name_lower or "sd1" in name_lower or "v1" in name_lower
+            if is_sd1 and not is_sd2:
+                cross_attention_dim = 768
+                attention_head_dim = 8
+                use_linear_projection = False
+            else:
+                # SD 2.1 architecture
+                cross_attention_dim = 1024
+                attention_head_dim = [5, 10, 20, 20]
+                use_linear_projection = True
+
+            config = {
+                "_class_name": "ControlNetModel",
+                "act_fn": "silu",
+                "attention_head_dim": attention_head_dim,
+                "block_out_channels": [320, 640, 1280, 1280],
+                "class_embed_type": None,
+                "conditioning_embedding_out_channels": [16, 32, 96, 256],
+                "controlnet_conditioning_channel_order": "rgb",
+                "cross_attention_dim": cross_attention_dim,
+                "down_block_types": [
+                    "CrossAttnDownBlock2D",
+                    "CrossAttnDownBlock2D",
+                    "CrossAttnDownBlock2D",
+                    "DownBlock2D",
+                ],
+                "downsample_padding": 1,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "in_channels": 4,
+                "layers_per_block": 2,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-05,
+                "norm_num_groups": 32,
+                "num_class_embeds": None,
+                "only_cross_attention": False,
+                "projection_class_embeddings_input_dim": None,
+                "resnet_time_scale_shift": "default",
+                "transformer_layers_per_block": 1,
+                "upcast_attention": False,
+                "use_linear_projection": use_linear_projection,
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+            print(f"  Wrote ControlNet config: {config_path}")
+
+        return ControlNetModel.from_single_file(
+            str(local_path),
+            config=str(local_path.parent),
+            torch_dtype=self.dtype,
+        )
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model."""
@@ -198,8 +305,8 @@ class StreamDiffusionPipeline(Pipeline):
 
     def _prepare_runtime_state(
         self,
-        prompt: str,
-        negative_prompt: str,
+        prompts: list[dict],
+        prompt_interpolation_method: str,
         num_inference_steps: int,
         guidance_scale: float,
         strength: float,
@@ -209,6 +316,7 @@ class StreamDiffusionPipeline(Pipeline):
         height: int,
         use_denoising_batch: bool,
         do_add_noise: bool,
+        transition: Optional[dict] = None,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         t_index_list: Optional[List[int]] = None,
     ):
@@ -268,15 +376,85 @@ class StreamDiffusionPipeline(Pipeline):
         else:
             self.x_t_latent_buffer = None
 
-        # Encode prompts
+        # Encode and blend current prompts
         self.do_classifier_free_guidance = self.guidance_scale > 1.0
-        self.prompt_embeds = self._encode_prompt(prompt, negative_prompt)
+        current_embeds, _ = self._encode_prompts_array(
+            prompts, prompt_interpolation_method
+        )
+
+        if transition is not None and not self.embedding_blender.is_transitioning():
+            # New transition requested — start it toward target_prompts
+            transition_config = parse_transition_config(transition)
+            target_prompts_raw = transition.get("target_prompts", [])
+
+            if transition_config.num_steps > 0 and target_prompts_raw:
+                target_prompts = self._normalize_prompts(target_prompts_raw)
+
+                # Use previous frame's embedding as the transition source
+                source_embedding = self._previous_prompt_embeddings
+                if source_embedding is None:
+                    source_embedding = current_embeds[0:1].detach()
+
+                # Encode target prompts without overwriting the current cache
+                target_texts = [p.get("text", "") for p in target_prompts]
+                target_weights = [p.get("weight", 1.0) for p in target_prompts]
+                target_encoded = [
+                    self._encode_single_prompt(t)[0] for t in target_texts
+                ]
+                target_embedding = self.embedding_blender.blend(
+                    target_encoded,
+                    target_weights,
+                    prompt_interpolation_method,
+                    cache_result=False,
+                )
+
+                print(
+                    f"\nStarting transition ({transition_config.num_steps} steps, method={transition_config.temporal_interpolation_method}):"
+                )
+                print(
+                    f"  Target prompts: {[p.get('text', '') for p in target_prompts]}"
+                )
+
+                self.embedding_blender.start_transition(
+                    source_embedding=source_embedding,
+                    target_embedding=target_embedding,
+                    num_steps=transition_config.num_steps,
+                    temporal_interpolation_method=transition_config.temporal_interpolation_method,
+                )
+
+                first_embedding = self.embedding_blender.get_next_embedding()
+                if first_embedding is not None:
+                    self.prompt_embeds = first_embedding.repeat(self.batch_size, 1, 1)
+                else:
+                    self.prompt_embeds = current_embeds
+            else:
+                self.prompt_embeds = current_embeds
+
+        elif self.embedding_blender.is_transitioning():
+            # Continue ongoing transition
+            next_embedding = self.embedding_blender.get_next_embedding()
+            if next_embedding is not None:
+                self.prompt_embeds = next_embedding.repeat(self.batch_size, 1, 1)
+                print(
+                    f"  Transition continuing, remaining steps: {len(self.embedding_blender._transition_queue)}"
+                )
+            else:
+                # Transition just completed
+                self.prompt_embeds = current_embeds
+
+        else:
+            self.prompt_embeds = current_embeds
+
+        # Cache embedding as source for the next transition
+        self._previous_prompt_embeddings = self.prompt_embeds[0:1].detach()
+
         print("\nPrompt embeddings:")
         print(f"  Shape: {self.prompt_embeds.shape}")
         print(
             f"  Range: [{self.prompt_embeds.min():.3f}, {self.prompt_embeds.max():.3f}]"
         )
         print(f"  Mean: {self.prompt_embeds.mean():.3f}")
+        print(f"  Num prompts: {len(prompts)}, Method: {prompt_interpolation_method}")
 
         # Set timesteps
         self._set_timesteps(num_inference_steps, strength)
@@ -284,39 +462,93 @@ class StreamDiffusionPipeline(Pipeline):
         # Initialize noise
         self._initialize_noise()
 
-    def _encode_prompt(
+    @staticmethod
+    def _normalize_prompts(prompts: str | list[str] | list[dict]) -> list[dict]:
+        """Normalize prompts to list[dict] format."""
+        if isinstance(prompts, str):
+            return [{"text": prompts, "weight": 1.0}]
+        if isinstance(prompts, list):
+            if len(prompts) == 0:
+                return [{"text": "", "weight": 1.0}]
+            # Check if it's a list of strings
+            if isinstance(prompts[0], str):
+                return [{"text": text, "weight": 1.0} for text in prompts]
+            # Already list[dict]
+            return prompts
+        return [{"text": str(prompts), "weight": 1.0}]
+
+    def _encode_single_prompt(
+        self, prompt_text: str
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode a single prompt string to embeddings.
+
+        Returns:
+            (prompt_embeds, pooled_embeds) tuple
+        """
+        # Use diffusers' built-in encoding
+        encoder_output = self.pipe.encode_prompt(
+            prompt=prompt_text,
+            device=self.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False,
+            negative_prompt=None,
+        )
+        prompt_embeds = encoder_output[0]  # [1, seq_len, hidden_dim]
+        pooled_embeds = encoder_output[2] if self.sdxl else None
+
+        return prompt_embeds, pooled_embeds
+
+    def _encode_prompts_array(
         self,
-        prompt: str,
-        negative_prompt: str = "",
-        use_prompt_weighting: bool = True,
-    ):
-        """Encode prompt to embeddings."""
-        # Always use classifier free guidance when negative prompt is present
-        do_classifier_free_guidance = (
-            negative_prompt and len(negative_prompt.strip()) > 0
+        prompt_items: list[dict],
+        interpolation_method: str = "linear",
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode multiple weighted prompts and blend them.
+
+        Args:
+            prompt_items: List of {"text": str, "weight": float}
+            interpolation_method: "linear" or "slerp"
+
+        Returns:
+            (blended_prompt_embeds, blended_pooled_embeds) tuple
+        """
+        if not prompt_items:
+            prompt_items = [{"text": "", "weight": 1.0}]
+
+        # Extract texts and weights
+        texts = [item.get("text", "") for item in prompt_items]
+        weights = [item.get("weight", 1.0) for item in prompt_items]
+
+        # Encode each prompt
+        all_prompt_embeds = []
+        all_pooled_embeds = [] if self.sdxl else None
+
+        for text in texts:
+            prompt_embeds, pooled_embeds = self._encode_single_prompt(text)
+            all_prompt_embeds.append(prompt_embeds)
+            if self.sdxl and pooled_embeds is not None:
+                all_pooled_embeds.append(pooled_embeds)
+
+        # Blend embeddings
+        blended_prompt_embeds = self.embedding_blender.blend(
+            all_prompt_embeds,
+            weights,
+            interpolation_method,
+            cache_result=True,
         )
 
-        if use_prompt_weighting:
-            if self.sdxl:
-                conditioning, pooled = self.compel_proc([prompt, negative_prompt])
-                text_embeds = pooled[0]
-            else:
-                conditioning = self.compel_proc([prompt, negative_prompt])
-                text_embeds = None
-            encoded_prompt = conditioning[0]
-        else:
-            encoder_output = self.pipe.encode_prompt(
-                prompt=prompt,
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=do_classifier_free_guidance,
-                negative_prompt=negative_prompt,
+        blended_pooled_embeds = None
+        if self.sdxl and all_pooled_embeds:
+            blended_pooled_embeds = self.embedding_blender.blend(
+                all_pooled_embeds,
+                weights,
+                interpolation_method,
+                cache_result=False,
             )
-            encoded_prompt = encoder_output[0]
-            text_embeds = encoder_output[2] if self.sdxl else None
 
-        if self.sdxl:
-            self.add_text_embeds = text_embeds
+        # Handle SDXL additional embeddings
+        if self.sdxl and blended_pooled_embeds is not None:
+            self.add_text_embeds = blended_pooled_embeds
             original_size = (self.height, self.width)
             crops_coords_top_left = (0, 0)
             target_size = (self.height, self.width)
@@ -329,7 +561,9 @@ class StreamDiffusionPipeline(Pipeline):
                 text_encoder_projection_dim=text_encoder_projection_dim,
             )
 
-        return encoded_prompt.repeat(self.batch_size, 1, 1)
+        return blended_prompt_embeds.repeat(
+            self.batch_size, 1, 1
+        ), blended_pooled_embeds
 
     def _set_timesteps(self, num_inference_steps: int, strength: float):
         """Set the timesteps for the diffusion process."""
@@ -377,6 +611,11 @@ class StreamDiffusionPipeline(Pipeline):
         alpha_prod_t_sqrt_list = []
         beta_prod_t_sqrt_list = []
         for timestep in self.sub_timesteps:
+            if timestep >= len(self.scheduler.alphas_cumprod):
+                print(
+                    f"Warning: timestep {timestep} is greater than the number of timesteps {len(self.scheduler.alphas_cumprod)}"
+                )
+                continue
             alpha_prod_t_sqrt = self.scheduler.alphas_cumprod[timestep].sqrt()
             beta_prod_t_sqrt = (1 - self.scheduler.alphas_cumprod[timestep]).sqrt()
             alpha_prod_t_sqrt_list.append(alpha_prod_t_sqrt)
@@ -518,11 +757,28 @@ class StreamDiffusionPipeline(Pipeline):
         else:
             x_t_latent_plus_uc = x_t_latent
 
+        # Compute ControlNet residuals if conditioning is available
+        down_block_res_samples = None
+        mid_block_res_sample = None
+        if self.controlnet is not None and self.controlnet_input is not None:
+            batch_size = x_t_latent_plus_uc.shape[0]
+            cond_image = self.controlnet_input.expand(batch_size, -1, -1, -1)
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                x_t_latent_plus_uc,
+                t_list,
+                encoder_hidden_states=self.prompt_embeds,
+                controlnet_cond=cond_image,
+                conditioning_scale=self.controlnet_conditioning_scale,
+                return_dict=False,
+            )
+
         model_pred = self.unet(
             x_t_latent_plus_uc,
             t_list,
             encoder_hidden_states=self.prompt_embeds,
             added_cond_kwargs=added_cond_kwargs,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
             return_dict=False,
         )[0]
 
@@ -668,14 +924,17 @@ class StreamDiffusionPipeline(Pipeline):
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
 
-        # Extract prompt from Scope's prompts list format
+        # Extract ControlNet conditioning frames (routed here by PipelineProcessor when vace_enabled=True)
+        vace_input_frames = kwargs.get("vace_input_frames", None)
+
+        # Extract prompts array from Scope
         prompts = kwargs.get("prompts", [])
-        if prompts and isinstance(prompts, list) and len(prompts) > 0:
-            # Scope passes prompts as [{"text": "...", "weight": 100.0}]
-            prompt = prompts[0].get("text", "")
-        else:
-            # Fallback to direct prompt parameter
-            prompt = kwargs.get("prompt", "")
+        # Normalize to list[dict] format
+        prompts = (
+            self._normalize_prompts(prompts)
+            if prompts
+            else [{"text": "", "weight": 1.0}]
+        )
 
         # Get config instance - Scope should pass this
         # Try different ways Scope might pass config
@@ -709,7 +968,7 @@ class StreamDiffusionPipeline(Pipeline):
             return default
 
         # Extract all parameters with config fallback
-        negative_prompt = get_param("negative_prompt", "")
+        prompt_interpolation_method = get_param("prompt_interpolation_method", "linear")
         guidance_scale = get_param("guidance_scale", 0.0)
 
         # SD Turbo: Use single timestep (t_index_list=[0]) but set schedule length
@@ -728,20 +987,61 @@ class StreamDiffusionPipeline(Pipeline):
         do_add_noise = get_param("do_add_noise", True)
         similar_image_filter_enabled = get_param("similar_image_filter_enabled", False)
         image_loopback = get_param("image_loopback", False)
+        vace_context_scale = get_param("vace_context_scale", 1.0)
 
+        # ControlNet conditioning diagnostics
+        print(f"[ControlNet] controlnet loaded: {self.controlnet is not None}")
         print(
-            f"Extracted prompt: {prompt[:50]}..."
-            if len(prompt) > 50
-            else f"Extracted prompt: {prompt}"
+            f"[ControlNet] vace_input_frames: {'present (' + str(len(vace_input_frames)) + ' frames)' if vace_input_frames is not None else 'ABSENT - check PipelineProcessor routing'}"
         )
         print(
-            f"Parameters: steps={num_inference_steps}, strength={strength}, guidance={guidance_scale}"
+            f"[ControlNet] video: {'present (' + str(len(video)) + ' frames)' if video is not None else 'absent'}"
         )
+        print(f"[ControlNet] vace_context_scale: {vace_context_scale}")
+
+        # Process ControlNet conditioning frame if available
+        self.controlnet_input = None
+        if (
+            self.controlnet is not None
+            and vace_input_frames is not None
+            and len(vace_input_frames) > 0
+        ):
+            cond_frame = vace_input_frames[0]
+            while cond_frame.ndim > 3:
+                cond_frame = cond_frame.squeeze(0)
+            if cond_frame.dtype == torch.uint8:
+                cond_frame = cond_frame.float() / 255.0
+            cond_frame = cond_frame.to(device=self.device, dtype=self.dtype)
+            # Resize if needed
+            actual_h, actual_w = cond_frame.shape[0], cond_frame.shape[1]
+            if actual_h != height or actual_w != width:
+                cond_np = (cond_frame.cpu().numpy() * 255).astype(np.uint8).squeeze()
+                cond_pil = PIL.Image.fromarray(cond_np).resize((width, height))
+                cond_frame = torch.from_numpy(np.array(cond_pil)).float() / 255.0
+                cond_frame = cond_frame.to(device=self.device, dtype=self.dtype)
+            # (H, W, C) -> (1, C, H, W)
+            self.controlnet_input = cond_frame.permute(2, 0, 1).unsqueeze(0)
+            self.controlnet_conditioning_scale = vace_context_scale
+            print(
+                f"[ControlNet] conditioning input ready: shape={self.controlnet_input.shape}, scale={vace_context_scale}"
+            )
+        else:
+            print(
+                f"[ControlNet] NO conditioning — controlnet={self.controlnet is not None}, vace_input_frames={'present' if vace_input_frames is not None else 'ABSENT'}"
+            )
+
+        print(f"Extracted prompts: {prompts}")
+        print(
+            f"Parameters: steps={num_inference_steps}, strength={strength}, guidance={guidance_scale}, blend={prompt_interpolation_method}"
+        )
+
+        # Extract transition (explicit transition overrides prompt-change detection)
+        transition = kwargs.get("transition", None)
 
         # Prepare runtime state
         self._prepare_runtime_state(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompts=prompts,
+            prompt_interpolation_method=prompt_interpolation_method,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             strength=strength,
@@ -751,6 +1051,7 @@ class StreamDiffusionPipeline(Pipeline):
             height=height,
             use_denoising_batch=use_denoising_batch,
             do_add_noise=do_add_noise,
+            transition=transition,
         )
 
         frame = None

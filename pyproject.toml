@@ -6,7 +6,6 @@ requires-python = ">=3.12"
 dependencies = [
     "torch",
     "diffusers",
-    "compel",
     "logfire",
     "numpy",
     "pillow",
