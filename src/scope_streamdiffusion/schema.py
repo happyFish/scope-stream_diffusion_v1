@@ -27,18 +27,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
 
     supports_lora = True
-    supports_vace = True
-
-    # Override base vace_context_scale to attach component="vace" — this is what
-    # triggers the VACE toggle + scale slider in the configSchema rendering path.
-    # Without this the toggle only appears in the legacy/no-schema branch.
-    vace_context_scale: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=2.0,
-        description="ControlNet conditioning scale (0.0 = no conditioning, 2.0 = maximum)",
-        json_schema_extra=ui_field_config(order=0, component="vace"),
-    )
 
     # ========================================
     # Model Configuration
@@ -47,22 +35,25 @@ class StreamDiffusionConfig(BasePipelineConfig):
     model_id_or_path: str = Field(
         default="stabilityai/sd-turbo",
         description="Model ID from HuggingFace or local path to model",
-        json_schema_extra=ui_field_config(
-            order=1,
-            label="Model",
-        ),
     )
 
     acceleration: Literal["none", "xformers", "tensorrt"] = Field(
         default="xformers",
         description="Hardware acceleration method",
-        json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
 
-    controlnet_model_id: str = Field(
-        default="https://huggingface.co/thibaud/controlnet-sd21/resolve/main/control_v11p_sd21_depth.safetensors",
-        description="HuggingFace model ID or local path for ControlNet (empty = disabled). Must be compatible with the base model.",
-        json_schema_extra=ui_field_config(order=3, label="ControlNet Model", is_load_param=True),
+    controlnet_mode: Literal["none", "depth", "scribble"] = Field(
+        default="none",
+        description="ControlNet conditioning mode. 'depth' runs Video Depth Anything internally and routes the depth map to ControlNet. First switch to a new mode stalls while the model loads.",
+        json_schema_extra=ui_field_config(order=3, label="ControlNet Mode"),
+    )
+
+    controlnet_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="ControlNet conditioning scale (0.0 = no effect, 2.0 = maximum)",
+        json_schema_extra=ui_field_config(order=4, label="ControlNet Scale"),
     )
 
     # ========================================

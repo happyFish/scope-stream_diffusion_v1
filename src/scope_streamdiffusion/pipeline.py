@@ -1,15 +1,11 @@
 """StreamDiffusion pipeline implementation for Scope."""
 
-import json
-import os
-import re
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
 import numpy as np
 import PIL.Image
 from diffusers import (
-    ControlNetModel,
     DiffusionPipeline,
     LCMScheduler,
     StableDiffusionXLPipeline,
@@ -20,8 +16,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 from scope.core.pipelines.interface import Pipeline, Requirements
 from scope.core.pipelines.blending import EmbeddingBlender, parse_transition_config
-from scope.core.pipelines.wan2_1.vace import VACEEnabledPipeline
 
+from .controlnet import ControlNetHandler
 from .schema import StreamDiffusionConfig
 
 if TYPE_CHECKING:
@@ -49,7 +45,7 @@ class SimilarImageFilter:
         return image_tensor
 
 
-class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
+class StreamDiffusionPipeline(Pipeline):
     """StreamDiffusion pipeline for real-time Stable Diffusion generation."""
 
     @classmethod
@@ -62,7 +58,6 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
         device: Optional[torch.device] = None,
         model_id: str = "stabilityai/sd-turbo",
         torch_dtype: torch.dtype = torch.float16,
-        controlnet_model_id: str = "",
         **kwargs,  # noqa: ARG002
     ) -> None:
         """Initialize the StreamDiffusion pipeline.
@@ -71,7 +66,6 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
             device: Torch device to use
             model_id: Model ID or path to load
             torch_dtype: Data type for tensors
-            controlnet_model_id: HuggingFace model ID or local path for ControlNet (empty = disabled)
         """
         self.device = (
             device
@@ -121,15 +115,10 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
         self.inference_time_ema = 0
 
         # ControlNet support
+        self._cn = ControlNetHandler(self.device, self.dtype)
         self.controlnet = None
         self.controlnet_input = None
         self.controlnet_conditioning_scale = 1.0
-
-        if controlnet_model_id:
-            print(f"Loading ControlNet: {controlnet_model_id}")
-            self.controlnet = self._load_controlnet(controlnet_model_id).to(self.device)
-            self.controlnet.eval()
-            print("ControlNet loaded")
 
         # Runtime state (will be set from kwargs in __call__)
         self.width = 512
@@ -142,120 +131,13 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
         self.cfg_type = "self"
         self.use_denoising_batch = True
         self.do_add_noise = False
-        self.strength = 1.0
+        self.strength = 0.9
         self.guidance_scale = 0.0
         self.delta = 1.0
         self.t_list = [0]
         self.similar_image_filter = False
 
         print("StreamDiffusion pipeline initialized")
-
-    def _load_controlnet(self, model_id: str) -> ControlNetModel:
-        """Load a ControlNet model, downloading via Scope's infrastructure if needed.
-
-        Accepts:
-          - HuggingFace URL: https://huggingface.co/{repo}/{resolve|blob}/{rev}/{file}
-          - Local .safetensors / .ckpt / .bin file path
-          - Full diffusers repo ID: org/repo (must have config.json)
-        """
-        from scope.core.config import get_models_dir
-        from scope.server.download_models import download_hf_repo
-
-        hf_url = re.match(
-            r"https://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+)",
-            model_id,
-        )
-        if hf_url:
-            repo_id, revision, filename = (
-                hf_url.group(1),
-                hf_url.group(2),
-                hf_url.group(3),
-            )
-            local_dir = get_models_dir() / repo_id.split("/")[-1]
-            local_path = local_dir / filename
-            if not local_path.exists():
-                print(f"  Downloading {filename} from {repo_id}")
-                download_hf_repo(
-                    repo_id=repo_id,
-                    local_dir=local_dir,
-                    allow_patterns=[filename],
-                    pipeline_id="streamdiffusion",
-                )
-            print(f"  Loaded from: {local_path}")
-            return self._from_single_file_with_config(local_path, filename)
-
-        if model_id.endswith((".safetensors", ".ckpt", ".bin")):
-            return self._from_single_file_with_config(
-                model_id, os.path.basename(model_id)
-            )
-
-        return ControlNetModel.from_pretrained(model_id, torch_dtype=self.dtype)
-
-    def _from_single_file_with_config(
-        self, local_path, filename: str
-    ) -> ControlNetModel:
-        """Load a single-file ControlNet checkpoint, writing a config.json alongside it
-        so diffusers doesn't try to fetch one from stable-diffusion-v1-5 on HuggingFace."""
-        from pathlib import Path
-
-        local_path = Path(local_path)
-        config_path = local_path.parent / "config.json"
-
-        if not config_path.exists():
-            # Detect SD version from filename; default to SD 2.1 if ambiguous
-            name_lower = filename.lower()
-            is_sd2 = "sd21" in name_lower or "sd2" in name_lower or "v2" in name_lower
-            is_sd1 = "sd15" in name_lower or "sd1" in name_lower or "v1" in name_lower
-            if is_sd1 and not is_sd2:
-                cross_attention_dim = 768
-                attention_head_dim = 8
-                use_linear_projection = False
-            else:
-                # SD 2.1 architecture
-                cross_attention_dim = 1024
-                attention_head_dim = [5, 10, 20, 20]
-                use_linear_projection = True
-
-            config = {
-                "_class_name": "ControlNetModel",
-                "act_fn": "silu",
-                "attention_head_dim": attention_head_dim,
-                "block_out_channels": [320, 640, 1280, 1280],
-                "class_embed_type": None,
-                "conditioning_embedding_out_channels": [16, 32, 96, 256],
-                "controlnet_conditioning_channel_order": "rgb",
-                "cross_attention_dim": cross_attention_dim,
-                "down_block_types": [
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "DownBlock2D",
-                ],
-                "downsample_padding": 1,
-                "flip_sin_to_cos": True,
-                "freq_shift": 0,
-                "in_channels": 4,
-                "layers_per_block": 2,
-                "mid_block_scale_factor": 1,
-                "norm_eps": 1e-05,
-                "norm_num_groups": 32,
-                "num_class_embeds": None,
-                "only_cross_attention": False,
-                "projection_class_embeddings_input_dim": None,
-                "resnet_time_scale_shift": "default",
-                "transformer_layers_per_block": 1,
-                "upcast_attention": False,
-                "use_linear_projection": use_linear_projection,
-            }
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=2)
-            print(f"  Wrote ControlNet config: {config_path}")
-
-        return ControlNetModel.from_single_file(
-            str(local_path),
-            config=str(local_path.parent),
-            torch_dtype=self.dtype,
-        )
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model."""
@@ -924,9 +806,6 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
 
-        # Extract ControlNet conditioning frames (routed here by PipelineProcessor when vace_enabled=True)
-        vace_input_frames = kwargs.get("vace_input_frames", None)
-
         # Extract prompts array from Scope
         prompts = kwargs.get("prompts", [])
         # Normalize to list[dict] format
@@ -987,48 +866,14 @@ class StreamDiffusionPipeline(Pipeline, VACEEnabledPipeline):
         do_add_noise = get_param("do_add_noise", True)
         similar_image_filter_enabled = get_param("similar_image_filter_enabled", False)
         image_loopback = get_param("image_loopback", False)
-        vace_context_scale = get_param("vace_context_scale", 1.0)
+        controlnet_mode = get_param("controlnet_mode", "none")
+        controlnet_scale = get_param("controlnet_scale", 1.0)
+        init_cache = kwargs.get("init_cache", False)
 
-        # ControlNet conditioning diagnostics
-        print(f"[ControlNet] controlnet loaded: {self.controlnet is not None}")
-        print(
-            f"[ControlNet] vace_input_frames: {'present (' + str(len(vace_input_frames)) + ' frames)' if vace_input_frames is not None else 'ABSENT - check PipelineProcessor routing'}"
-        )
-        print(
-            f"[ControlNet] video: {'present (' + str(len(video)) + ' frames)' if video is not None else 'absent'}"
-        )
-        print(f"[ControlNet] vace_context_scale: {vace_context_scale}")
-
-        # Process ControlNet conditioning frame if available
-        self.controlnet_input = None
-        if (
-            self.controlnet is not None
-            and vace_input_frames is not None
-            and len(vace_input_frames) > 0
-        ):
-            cond_frame = vace_input_frames[0]
-            while cond_frame.ndim > 3:
-                cond_frame = cond_frame.squeeze(0)
-            if cond_frame.dtype == torch.uint8:
-                cond_frame = cond_frame.float() / 255.0
-            cond_frame = cond_frame.to(device=self.device, dtype=self.dtype)
-            # Resize if needed
-            actual_h, actual_w = cond_frame.shape[0], cond_frame.shape[1]
-            if actual_h != height or actual_w != width:
-                cond_np = (cond_frame.cpu().numpy() * 255).astype(np.uint8).squeeze()
-                cond_pil = PIL.Image.fromarray(cond_np).resize((width, height))
-                cond_frame = torch.from_numpy(np.array(cond_pil)).float() / 255.0
-                cond_frame = cond_frame.to(device=self.device, dtype=self.dtype)
-            # (H, W, C) -> (1, C, H, W)
-            self.controlnet_input = cond_frame.permute(2, 0, 1).unsqueeze(0)
-            self.controlnet_conditioning_scale = vace_context_scale
-            print(
-                f"[ControlNet] conditioning input ready: shape={self.controlnet_input.shape}, scale={vace_context_scale}"
-            )
-        else:
-            print(
-                f"[ControlNet] NO conditioning — controlnet={self.controlnet is not None}, vace_input_frames={'present' if vace_input_frames is not None else 'ABSENT'}"
-            )
+        self._cn.update(controlnet_mode, video, width, height, controlnet_scale, init_cache)
+        self.controlnet = self._cn.model
+        self.controlnet_input = self._cn.input
+        self.controlnet_conditioning_scale = self._cn.scale
 
         print(f"Extracted prompts: {prompts}")
         print(
