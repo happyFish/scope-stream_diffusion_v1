@@ -40,7 +40,11 @@ class ControlNetHandler:
         self._controlnet_cache: dict[str, ControlNetModel] = {}
         self._depth_model = None
         self._depth_hidden_state = None
+        self._depth_min_ema: float | None = None
+        self._depth_max_ema: float | None = None
+        self._prev_depth_input: torch.Tensor | None = None
         self._scribble_model = None
+        self._prev_scribble_input: torch.Tensor | None = None
 
         self.model: Optional[ControlNetModel] = None
         self.input: Optional[torch.Tensor] = None
@@ -69,6 +73,9 @@ class ControlNetHandler:
 
             if reset:
                 self._depth_hidden_state = None
+                self._depth_min_ema = None
+                self._depth_max_ema = None
+                self._prev_depth_input = None
 
             frame_np = video[0].squeeze(0).cpu().numpy()
             if frame_np.dtype != np.uint8:
@@ -82,8 +89,16 @@ class ControlNetHandler:
                 cached_hidden_state_list=self._depth_hidden_state,
             )
 
+            # EMA on normalization bounds — prevents scale/contrast jumps between frames
             d_min, d_max = float(depth_np.min()), float(depth_np.max())
-            depth_norm = (depth_np - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_np)
+            if self._depth_min_ema is None:
+                self._depth_min_ema, self._depth_max_ema = d_min, d_max
+            else:
+                a = 0.1  # lower = smoother bounds, higher = more responsive
+                self._depth_min_ema = a * d_min + (1 - a) * self._depth_min_ema
+                self._depth_max_ema = a * d_max + (1 - a) * self._depth_max_ema
+            rng = self._depth_max_ema - self._depth_min_ema
+            depth_norm = np.clip((depth_np - self._depth_min_ema) / rng, 0.0, 1.0) if rng > 0 else np.zeros_like(depth_np)
 
             if depth_norm.shape != (height, width):
                 depth_pil = PIL.Image.fromarray((depth_norm * 255).astype(np.uint8)).resize((width, height))
@@ -93,8 +108,17 @@ class ControlNetHandler:
             depth_t = torch.from_numpy(depth_norm).to(device=self.device, dtype=self.dtype)
             self.input = depth_t.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
 
+            # Output blending — catches residual pixel-level flicker after bounds stabilization
+            if self._prev_depth_input is not None:
+                a = 0.5  # weight of current frame; lower = smoother but more lag
+                self.input = a * self.input + (1 - a) * self._prev_depth_input
+            self._prev_depth_input = self.input
+
         elif mode == "scribble" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("scribble")
+
+            if reset:
+                self._prev_scribble_input = None
 
             frame = video[0].squeeze(0)  # (H, W, C)
             if frame.dtype == torch.uint8:
@@ -115,6 +139,11 @@ class ControlNetHandler:
 
             # (1, 1, H, W) -> (1, 3, H, W)
             self.input = scribble.to(dtype=self.dtype).repeat(1, 3, 1, 1)
+
+            if self._prev_scribble_input is not None:
+                a = 0.5
+                self.input = a * self.input + (1 - a) * self._prev_scribble_input
+            self._prev_scribble_input = self.input
 
     def _get_model_for_mode(self, mode: str) -> ControlNetModel:
         if mode not in self._controlnet_cache:
