@@ -106,14 +106,9 @@ class ControlNetHandler:
                 )
             )  # depth_t: (H, W) on self.device
 
-            d_min, d_max = float(depth_t.min()), float(depth_t.max())
-            print(f"depth before clamp_min: {d_min}, d_max: {d_max}")
-            depth_t = torch.clamp(depth_t, min=depth_min, max=depth_max)
-
             # EMA on normalization bounds — prevents scale/contrast jumps between frames
             # .min()/.max() are GPU scalars; extracting as Python floats for EMA arithmetic
             d_min, d_max = float(depth_t.min()), float(depth_t.max())
-            print(f"after clamp: d_min: {d_min}, d_max: {d_max}")
             if self._depth_min_ema is None:
                 self._depth_min_ema, self._depth_max_ema = d_min, d_max
             else:
@@ -138,6 +133,10 @@ class ControlNetHandler:
                     .squeeze(0)
                     .squeeze(0)
                 )
+
+            print(f"before clamp: d_min: {depth_norm.min()}, d_max: {depth_norm.max()}")
+            depth_norm = torch.clamp(depth_norm, min=depth_min, max=depth_max)
+            print(f"after clamp: d_min: {depth_norm.min()}, d_max: {depth_norm.max()}")
 
             # (H, W) -> (1, 3, H, W), already on GPU
             self.input = (

@@ -62,15 +62,15 @@ class StreamDiffusionConfig(BasePipelineConfig):
     depth_min: float = Field(
         default=0,
         ge=0.0,
-        le=12.0,
+        le=1,
         description="Minimum depth value for ControlNet",
         json_schema_extra=ui_field_config(order=5, label="Depth Min"),
     )
 
     depth_max: float = Field(
-        default=12,
+        default=1,
         ge=0.0,
-        le=12.0,
+        le=1,
         description="Maximum depth value for ControlNet",
         json_schema_extra=ui_field_config(order=6, label="Depth Max"),
     )
