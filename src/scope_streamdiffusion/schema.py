@@ -24,7 +24,10 @@ class StreamDiffusionConfig(BasePipelineConfig):
     supports_prompts = True
 
     # Pipeline modes
-    modes = {"video": ModeDefaults(default=True)}
+    modes = {
+        "video": ModeDefaults(default=True),
+        "text": ModeDefaults(),
+    }
 
     supports_lora = True
 
@@ -56,6 +59,14 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=4, label="ControlNet Scale"),
     )
 
+    controlnet_temporal_smoothing: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Temporal blending of the ControlNet conditioning map. 0.0 = fully smoothed (previous frame only), 1.0 = no smoothing (current frame only). Lower values reduce flicker; higher values reduce latency.",
+        json_schema_extra=ui_field_config(order=5, label="ControlNet Smoothing"),
+    )
+
     # ========================================
     # Generation Parameters
     # ========================================
@@ -64,7 +75,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
     prompt_interpolation_method: Literal["linear", "slerp"] = Field(
         default="linear",
         description="Method for blending multiple prompts spatially",
-        json_schema_extra=ui_field_config(order=10, label="Blend Method"),
     )
 
     seed: int = Field(
@@ -84,15 +94,15 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=8.0,
         description="Classifier-free guidance scale (0 = none, higher = more prompt adherence)",
-        json_schema_extra=ui_field_config(order=20, label="Guidance Scale"),
+        # json_schema_extra=ui_field_config(order=20, label="Guidance Scale"),
     )
 
     num_inference_steps: int = Field(
-        default=6,
+        default=2,
         ge=1,
         le=50,
         description="Number of denoising steps",
-        json_schema_extra=ui_field_config(order=21, label="Inference Steps"),
+        # json_schema_extra=ui_field_config(order=21, label="Inference Steps"),
     )
 
     strength: float = Field(
@@ -112,25 +122,25 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=2.0,
         description="StreamDiffusion delta parameter",
-        json_schema_extra=ui_field_config(order=30, label="Delta"),
+        # json_schema_extra=ui_field_config(order=30, label="Delta"),
     )
 
     do_add_noise: bool = Field(
         default=True,
         description="Add noise between denoising steps",
-        json_schema_extra=ui_field_config(order=31, label="Add Noise"),
+        # json_schema_extra=ui_field_config(order=31, label="Add Noise"),
     )
 
     use_denoising_batch: bool = Field(
         default=True,
         description="Use batch denoising for better performance",
-        json_schema_extra=ui_field_config(order=32, label="Batch Denoising"),
+        # json_schema_extra=ui_field_config(order=32, label="Batch Denoising"),
     )
 
     use_lcm_lora: bool = Field(
         default=True,
         description="Use LCM LoRA for faster inference",
-        json_schema_extra=ui_field_config(order=33, label="Use LCM LoRA"),
+        # json_schema_extra=ui_field_config(order=33, label="Use LCM LoRA"),
     )
 
     # ========================================
@@ -140,7 +150,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     similar_image_filter_enabled: bool = Field(
         default=False,
         description="Enable similar image filter to skip redundant frames",
-        json_schema_extra=ui_field_config(order=40, label="Similar Image Filter"),
+        # json_schema_extra=ui_field_config(order=40, label="Similar Image Filter"),
     )
 
     similar_image_filter_threshold: float = Field(
@@ -148,7 +158,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=1.0,
         description="Similarity threshold (higher = more strict filtering)",
-        json_schema_extra=ui_field_config(order=41, label="Filter Threshold"),
+        # json_schema_extra=ui_field_config(order=41, label="Filter Threshold"),
     )
 
     # ========================================
@@ -167,7 +177,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=128,
         le=2048,
         description="Output width",
-        json_schema_extra=ui_field_config(order=60, label="Width"),
+        # json_schema_extra=ui_field_config(order=60, label="Width"),
     )
 
     height: int = Field(
@@ -175,5 +185,5 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=128,
         le=2048,
         description="Output height",
-        json_schema_extra=ui_field_config(order=61, label="Height"),
+        # json_schema_extra=ui_field_config(order=61, label="Height"),
     )

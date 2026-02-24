@@ -137,6 +137,15 @@ class StreamDiffusionPipeline(Pipeline):
         self.t_list = [0]
         self.similar_image_filter = False
 
+        # Cache keys for _prepare_runtime_state — None forces full recompute on first call
+        self._schedule_key: tuple | None = (
+            None  # (num_inference_steps, strength, t_index_list)
+        )
+        self._last_seed: int | None = None
+        self._noise_shape: tuple | None = None  # (batch_size, latent_h, latent_w)
+        self._prompts_key: tuple | None = None
+        self._cached_base_embed: torch.Tensor | None = None  # (1, seq_len, hidden_dim)
+
         print("StreamDiffusion pipeline initialized")
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
@@ -183,7 +192,10 @@ class StreamDiffusionPipeline(Pipeline):
         Returns:
             Requirements: Pipeline requirements (e.g., input size)
         """
-        return Requirements(input_size=1)  # Process 1 frame at a time
+        if kwargs.get("video") is not None:
+            return Requirements(input_size=1)
+        else:
+            None
 
     def _prepare_runtime_state(
         self,
@@ -204,66 +216,101 @@ class StreamDiffusionPipeline(Pipeline):
     ):
         """Prepare runtime state from parameters.
 
-        This should be called at the start of __call__ to set up the pipeline
-        for the current generation.
+        Expensive operations (timestep schedule, noise buffers, prompt encoding) are
+        gated behind change-detection so they only run when the relevant parameters
+        actually change.  On a steady-state stream with fixed parameters only the
+        transition/embedding-blender path executes per frame.
         """
-        # Set dimensions
+        # --- Dimensions ---
+        dims_changed = width != self.width or height != self.height
         self.width = width
         self.height = height
-        self.latent_height = int(height // self.pipe.vae_scale_factor)
-        self.latent_width = int(width // self.pipe.vae_scale_factor)
+        if dims_changed:
+            self.latent_height = int(height // self.pipe.vae_scale_factor)
+            self.latent_width = int(width // self.pipe.vae_scale_factor)
 
-        # Set parameters
+        # --- Cheap scalar assignments ---
         self.strength = strength
         self.guidance_scale = guidance_scale
         self.delta = delta
         self.cfg_type = cfg_type
         self.use_denoising_batch = use_denoising_batch
         self.do_add_noise = do_add_noise
+        self.do_classifier_free_guidance = guidance_scale > 1.0
 
-        # Set timestep indices
+        # --- Batch size ---
         if t_index_list is None:
-            # For SD Turbo/LCM models, use single step for best results
-            # For other models, can use multiple steps
-            t_index_list = [0]  # Single step denoising (like your working project!)
+            t_index_list = [0]
         self.t_list = t_index_list
         self.denoising_steps_num = len(t_index_list)
-
-        print(
-            f"Using t_index_list: {t_index_list} from {num_inference_steps} total steps"
-        )
-
-        # Calculate batch size
         self.frame_bff_size = 1
-        if use_denoising_batch:
-            self.batch_size = self.denoising_steps_num * self.frame_bff_size
-        else:
-            self.batch_size = self.frame_bff_size
-
-        # Set random seed
-        self.generator.manual_seed(seed)
-
-        # Initialize latent buffer
-        if self.denoising_steps_num > 1:
-            self.x_t_latent_buffer = torch.zeros(
-                (
-                    (self.denoising_steps_num - 1) * self.frame_bff_size,
-                    4,
-                    self.latent_height,
-                    self.latent_width,
-                ),
-                dtype=self.dtype,
-                device=self.device,
-            )
-        else:
-            self.x_t_latent_buffer = None
-
-        # Encode and blend current prompts
-        self.do_classifier_free_guidance = self.guidance_scale > 1.0
-        current_embeds, _ = self._encode_prompts_array(
-            prompts, prompt_interpolation_method
+        self.batch_size = (
+            self.denoising_steps_num * self.frame_bff_size
+            if use_denoising_batch
+            else self.frame_bff_size
         )
 
+        # --- Timestep schedule: only recompute when schedule params change ---
+        schedule_key = (num_inference_steps, strength, tuple(t_index_list))
+        if schedule_key != self._schedule_key:
+            print(
+                f"Using t_index_list: {t_index_list} from {num_inference_steps} total steps"
+            )
+            self._set_timesteps(num_inference_steps, strength)
+            self._schedule_key = schedule_key
+
+        # --- Seed + noise buffers: only reset when seed or spatial shape changes ---
+        noise_shape = (self.batch_size, self.latent_height, self.latent_width)
+        seed_changed = seed != self._last_seed
+        shape_changed = noise_shape != self._noise_shape or dims_changed
+
+        if seed_changed:
+            self.generator.manual_seed(seed)
+            self._last_seed = seed
+
+        if seed_changed or shape_changed:
+            if self.denoising_steps_num > 1:
+                self.x_t_latent_buffer = torch.zeros(
+                    (
+                        (self.denoising_steps_num - 1) * self.frame_bff_size,
+                        4,
+                        self.latent_height,
+                        self.latent_width,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            else:
+                self.x_t_latent_buffer = None
+            self._initialize_noise()
+            self._noise_shape = noise_shape
+
+        # --- Prompt embeddings: only re-encode when prompts or method changes ---
+        # For SDXL add_time_ids depend on spatial dimensions, so include them in the key.
+        prompts_key = (
+            tuple((p.get("text", ""), p.get("weight", 1.0)) for p in prompts),
+            prompt_interpolation_method,
+            (width, height) if self.sdxl else (),
+        )
+        if prompts_key != self._prompts_key:
+            raw_embeds, _ = self._encode_prompts_array(
+                prompts, prompt_interpolation_method
+            )
+            self._cached_base_embed = raw_embeds[0:1]  # store un-repeated (1, seq, dim)
+            self._prompts_key = prompts_key
+            print("\nPrompt embeddings:")
+            print(f"  Shape: {self._cached_base_embed.shape}")
+            print(
+                f"  Range: [{self._cached_base_embed.min():.3f}, {self._cached_base_embed.max():.3f}]"
+            )
+            print(f"  Mean: {self._cached_base_embed.mean():.3f}")
+            print(
+                f"  Num prompts: {len(prompts)}, Method: {prompt_interpolation_method}"
+            )
+
+        current_embeds = self._cached_base_embed.repeat(self.batch_size, 1, 1)
+
+        # --- Transition / blending ---
         if transition is not None and not self.embedding_blender.is_transitioning():
             # New transition requested — start it toward target_prompts
             transition_config = parse_transition_config(transition)
@@ -272,12 +319,10 @@ class StreamDiffusionPipeline(Pipeline):
             if transition_config.num_steps > 0 and target_prompts_raw:
                 target_prompts = self._normalize_prompts(target_prompts_raw)
 
-                # Use previous frame's embedding as the transition source
                 source_embedding = self._previous_prompt_embeddings
                 if source_embedding is None:
                     source_embedding = current_embeds[0:1].detach()
 
-                # Encode target prompts without overwriting the current cache
                 target_texts = [p.get("text", "") for p in target_prompts]
                 target_weights = [p.get("weight", 1.0) for p in target_prompts]
                 target_encoded = [
@@ -329,20 +374,6 @@ class StreamDiffusionPipeline(Pipeline):
 
         # Cache embedding as source for the next transition
         self._previous_prompt_embeddings = self.prompt_embeds[0:1].detach()
-
-        print("\nPrompt embeddings:")
-        print(f"  Shape: {self.prompt_embeds.shape}")
-        print(
-            f"  Range: [{self.prompt_embeds.min():.3f}, {self.prompt_embeds.max():.3f}]"
-        )
-        print(f"  Mean: {self.prompt_embeds.mean():.3f}")
-        print(f"  Num prompts: {len(prompts)}, Method: {prompt_interpolation_method}")
-
-        # Set timesteps
-        self._set_timesteps(num_inference_steps, strength)
-
-        # Initialize noise
-        self._initialize_noise()
 
     @staticmethod
     def _normalize_prompts(prompts: str | list[str] | list[dict]) -> list[dict]:
@@ -868,9 +899,18 @@ class StreamDiffusionPipeline(Pipeline):
         image_loopback = get_param("image_loopback", False)
         controlnet_mode = get_param("controlnet_mode", "none")
         controlnet_scale = get_param("controlnet_scale", 1.0)
+        controlnet_temporal_smoothing = get_param("controlnet_temporal_smoothing", 0.5)
         init_cache = kwargs.get("init_cache", False)
 
-        self._cn.update(controlnet_mode, video, width, height, controlnet_scale, init_cache)
+        self._cn.update(
+            controlnet_mode,
+            video,
+            width,
+            height,
+            controlnet_scale,
+            init_cache,
+            controlnet_temporal_smoothing,
+        )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
         self.controlnet_conditioning_scale = self._cn.scale

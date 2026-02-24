@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn.functional as F
 from diffusers import ControlNetModel
 
 # ControlNet model IDs keyed by controlnet_mode
@@ -58,11 +59,17 @@ class ControlNetHandler:
         height: int,
         scale: float,
         reset: bool,
+        temporal_smoothing: float = 0.5,
     ) -> None:
         """Update ControlNet state for the current frame.
 
         Sets self.model, self.input, self.scale based on mode. Call this at the
         start of each __call__ before running the UNet step.
+
+        Args:
+            temporal_smoothing: Weight of the current frame in the blend with the
+                previous conditioning map. 1.0 = no smoothing (lowest latency),
+                0.0 = fully smoothed (previous frame only).
         """
         self.model = None
         self.input = None
@@ -81,16 +88,19 @@ class ControlNetHandler:
             if frame_np.dtype != np.uint8:
                 frame_np = (np.clip(frame_np, 0.0, 1.0) * 255).astype(np.uint8)
 
-            depth_np, self._depth_hidden_state = self._get_depth_preprocessor().infer_video_depth_one(
+            # return_tensor=True keeps depth on GPU — avoids an extra GPU→CPU→GPU roundtrip
+            depth_t, self._depth_hidden_state = self._get_depth_preprocessor().infer_video_depth_one(
                 frame_np,
                 input_size=518,
                 device="cuda" if self.device.type == "cuda" else "cpu",
                 fp32=False,
                 cached_hidden_state_list=self._depth_hidden_state,
-            )
+                return_tensor=True,
+            )  # depth_t: (H, W) on self.device
 
             # EMA on normalization bounds — prevents scale/contrast jumps between frames
-            d_min, d_max = float(depth_np.min()), float(depth_np.max())
+            # .min()/.max() are GPU scalars; extracting as Python floats for EMA arithmetic
+            d_min, d_max = float(depth_t.min()), float(depth_t.max())
             if self._depth_min_ema is None:
                 self._depth_min_ema, self._depth_max_ema = d_min, d_max
             else:
@@ -98,20 +108,22 @@ class ControlNetHandler:
                 self._depth_min_ema = a * d_min + (1 - a) * self._depth_min_ema
                 self._depth_max_ema = a * d_max + (1 - a) * self._depth_max_ema
             rng = self._depth_max_ema - self._depth_min_ema
-            depth_norm = np.clip((depth_np - self._depth_min_ema) / rng, 0.0, 1.0) if rng > 0 else np.zeros_like(depth_np)
+            depth_norm = ((depth_t - self._depth_min_ema) / rng).clamp(0.0, 1.0) if rng > 0 else torch.zeros_like(depth_t)
 
             if depth_norm.shape != (height, width):
-                depth_pil = PIL.Image.fromarray((depth_norm * 255).astype(np.uint8)).resize((width, height))
-                depth_norm = np.array(depth_pil).astype(np.float32) / 255.0
+                depth_norm = F.interpolate(
+                    depth_norm.unsqueeze(0).unsqueeze(0),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=True,
+                ).squeeze(0).squeeze(0)
 
-            # (H, W) -> (1, 3, H, W)
-            depth_t = torch.from_numpy(depth_norm).to(device=self.device, dtype=self.dtype)
-            self.input = depth_t.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+            # (H, W) -> (1, 3, H, W), already on GPU
+            self.input = depth_norm.to(dtype=self.dtype).unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
 
             # Output blending — catches residual pixel-level flicker after bounds stabilization
-            if self._prev_depth_input is not None:
-                a = 0.5  # weight of current frame; lower = smoother but more lag
-                self.input = a * self.input + (1 - a) * self._prev_depth_input
+            if self._prev_depth_input is not None and temporal_smoothing < 1.0:
+                self.input = temporal_smoothing * self.input + (1 - temporal_smoothing) * self._prev_depth_input
             self._prev_depth_input = self.input
 
         elif mode == "scribble" and video is not None and len(video) > 0:
@@ -140,9 +152,8 @@ class ControlNetHandler:
             # (1, 1, H, W) -> (1, 3, H, W)
             self.input = scribble.to(dtype=self.dtype).repeat(1, 3, 1, 1)
 
-            if self._prev_scribble_input is not None:
-                a = 0.5
-                self.input = a * self.input + (1 - a) * self._prev_scribble_input
+            if self._prev_scribble_input is not None and temporal_smoothing < 1.0:
+                self.input = temporal_smoothing * self.input + (1 - temporal_smoothing) * self._prev_scribble_input
             self._prev_scribble_input = self.input
 
     def _get_model_for_mode(self, mode: str) -> ControlNetModel:
