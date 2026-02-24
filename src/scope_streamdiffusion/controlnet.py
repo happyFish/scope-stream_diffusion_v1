@@ -19,7 +19,11 @@ MODEL_IDS: dict[str, str] = {
 
 _SCRIBBLE_CHECKPOINT = "VACE-Annotators/scribble/anime_style/netG_A_latest.pth"
 
-_DEPTH_MODEL_CONFIG = {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]}
+_DEPTH_MODEL_CONFIG = {
+    "encoder": "vits",
+    "features": 64,
+    "out_channels": [48, 96, 192, 384],
+}
 _DEPTH_CHECKPOINT = "Video-Depth-Anything-Small/video_depth_anything_vits.pth"
 
 
@@ -59,7 +63,9 @@ class ControlNetHandler:
         height: int,
         scale: float,
         reset: bool,
-        temporal_smoothing: float = 0.5,
+        temporal_smoothing: float = 1.0,
+        depth_min: float = 0,
+        depth_max: float = 12,
     ) -> None:
         """Update ControlNet state for the current frame.
 
@@ -89,18 +95,25 @@ class ControlNetHandler:
                 frame_np = (np.clip(frame_np, 0.0, 1.0) * 255).astype(np.uint8)
 
             # return_tensor=True keeps depth on GPU — avoids an extra GPU→CPU→GPU roundtrip
-            depth_t, self._depth_hidden_state = self._get_depth_preprocessor().infer_video_depth_one(
-                frame_np,
-                input_size=518,
-                device="cuda" if self.device.type == "cuda" else "cpu",
-                fp32=False,
-                cached_hidden_state_list=self._depth_hidden_state,
-                return_tensor=True,
+            depth_t, self._depth_hidden_state = (
+                self._get_depth_preprocessor().infer_video_depth_one(
+                    frame_np,
+                    input_size=518,
+                    device="cuda" if self.device.type == "cuda" else "cpu",
+                    fp32=False,
+                    cached_hidden_state_list=self._depth_hidden_state,
+                    return_tensor=True,
+                )
             )  # depth_t: (H, W) on self.device
+
+            d_min, d_max = float(depth_t.min()), float(depth_t.max())
+            print(f"depth before clamp_min: {d_min}, d_max: {d_max}")
+            depth_t = torch.clamp(depth_t, min=depth_min, max=depth_max)
 
             # EMA on normalization bounds — prevents scale/contrast jumps between frames
             # .min()/.max() are GPU scalars; extracting as Python floats for EMA arithmetic
             d_min, d_max = float(depth_t.min()), float(depth_t.max())
+            print(f"after clamp: d_min: {d_min}, d_max: {d_max}")
             if self._depth_min_ema is None:
                 self._depth_min_ema, self._depth_max_ema = d_min, d_max
             else:
@@ -108,22 +121,38 @@ class ControlNetHandler:
                 self._depth_min_ema = a * d_min + (1 - a) * self._depth_min_ema
                 self._depth_max_ema = a * d_max + (1 - a) * self._depth_max_ema
             rng = self._depth_max_ema - self._depth_min_ema
-            depth_norm = ((depth_t - self._depth_min_ema) / rng).clamp(0.0, 1.0) if rng > 0 else torch.zeros_like(depth_t)
+            depth_norm = (
+                ((depth_t - self._depth_min_ema) / rng).clamp(0.0, 1.0)
+                if rng > 0
+                else torch.zeros_like(depth_t)
+            )
 
             if depth_norm.shape != (height, width):
-                depth_norm = F.interpolate(
-                    depth_norm.unsqueeze(0).unsqueeze(0),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=True,
-                ).squeeze(0).squeeze(0)
+                depth_norm = (
+                    F.interpolate(
+                        depth_norm.unsqueeze(0).unsqueeze(0),
+                        size=(height, width),
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
 
             # (H, W) -> (1, 3, H, W), already on GPU
-            self.input = depth_norm.to(dtype=self.dtype).unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+            self.input = (
+                depth_norm.to(dtype=self.dtype)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(1, 3, 1, 1)
+            )
 
             # Output blending — catches residual pixel-level flicker after bounds stabilization
             if self._prev_depth_input is not None and temporal_smoothing < 1.0:
-                self.input = temporal_smoothing * self.input + (1 - temporal_smoothing) * self._prev_depth_input
+                self.input = (
+                    temporal_smoothing * self.input
+                    + (1 - temporal_smoothing) * self._prev_depth_input
+                )
             self._prev_depth_input = self.input
 
         elif mode == "scribble" and video is not None and len(video) > 0:
@@ -137,23 +166,39 @@ class ControlNetHandler:
                 frame = frame.float() / 255.0
 
             # (H, W, C) -> (1, C, H, W)
-            frame_input = frame.to(device=self.device, dtype=self.dtype).permute(2, 0, 1).unsqueeze(0)
+            frame_input = (
+                frame.to(device=self.device, dtype=self.dtype)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+            )
 
             with torch.no_grad():
-                scribble = self._get_scribble_preprocessor()(frame_input)  # (1, 1, H, W)
+                scribble = self._get_scribble_preprocessor()(
+                    frame_input
+                )  # (1, 1, H, W)
 
             # Resize to target resolution if needed
             if scribble.shape[2] != height or scribble.shape[3] != width:
                 scribble_np = scribble.squeeze().cpu().float().numpy()
-                scribble_pil = PIL.Image.fromarray((scribble_np * 255).astype(np.uint8)).resize((width, height))
+                scribble_pil = PIL.Image.fromarray(
+                    (scribble_np * 255).astype(np.uint8)
+                ).resize((width, height))
                 scribble_norm = np.array(scribble_pil).astype(np.float32) / 255.0
-                scribble = torch.from_numpy(scribble_norm).to(device=self.device, dtype=self.dtype).unsqueeze(0).unsqueeze(0)
+                scribble = (
+                    torch.from_numpy(scribble_norm)
+                    .to(device=self.device, dtype=self.dtype)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
 
             # (1, 1, H, W) -> (1, 3, H, W)
             self.input = scribble.to(dtype=self.dtype).repeat(1, 3, 1, 1)
 
             if self._prev_scribble_input is not None and temporal_smoothing < 1.0:
-                self.input = temporal_smoothing * self.input + (1 - temporal_smoothing) * self._prev_scribble_input
+                self.input = (
+                    temporal_smoothing * self.input
+                    + (1 - temporal_smoothing) * self._prev_scribble_input
+                )
             self._prev_scribble_input = self.input
 
     def _get_model_for_mode(self, mode: str) -> ControlNetModel:
@@ -169,7 +214,9 @@ class ControlNetHandler:
     def _get_depth_preprocessor(self):
         if self._depth_model is None:
             from scope.core.config import get_model_file_path
-            from scope.core.pipelines.video_depth_anything.modules import VideoDepthAnything
+            from scope.core.pipelines.video_depth_anything.modules import (
+                VideoDepthAnything,
+            )
 
             print("[Depth] Loading VideoDepthAnything model...")
             checkpoint_path = get_model_file_path(_DEPTH_CHECKPOINT)
@@ -189,7 +236,9 @@ class ControlNetHandler:
 
             print("[Scribble] Loading ContourInference model...")
             checkpoint_path = get_model_file_path(_SCRIBBLE_CHECKPOINT)
-            model = ContourInference(input_nc=3, output_nc=1, n_residual_blocks=3, sigmoid=True)
+            model = ContourInference(
+                input_nc=3, output_nc=1, n_residual_blocks=3, sigmoid=True
+            )
             model.load_state_dict(
                 torch.load(checkpoint_path, map_location="cpu", weights_only=True),
                 strict=True,
@@ -222,11 +271,15 @@ class ControlNetHandler:
             return self._from_single_file_with_config(local_path, filename)
 
         if model_id.endswith((".safetensors", ".ckpt", ".bin")):
-            return self._from_single_file_with_config(model_id, os.path.basename(model_id))
+            return self._from_single_file_with_config(
+                model_id, os.path.basename(model_id)
+            )
 
         return ControlNetModel.from_pretrained(model_id, torch_dtype=self.dtype)
 
-    def _from_single_file_with_config(self, local_path, filename: str) -> ControlNetModel:
+    def _from_single_file_with_config(
+        self, local_path, filename: str
+    ) -> ControlNetModel:
         from pathlib import Path
 
         local_path = Path(local_path)

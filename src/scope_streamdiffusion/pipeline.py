@@ -872,6 +872,8 @@ class StreamDiffusionPipeline(Pipeline):
         controlnet_scale = get_param("controlnet_scale", 1.0)
         controlnet_temporal_smoothing = get_param("controlnet_temporal_smoothing", 0.5)
         init_cache = kwargs.get("init_cache", False)
+        depth_min = get_param("depth_min", 0)
+        depth_max = get_param("depth_max", 12)
 
         self._cn.update(
             controlnet_mode,
@@ -881,6 +883,8 @@ class StreamDiffusionPipeline(Pipeline):
             controlnet_scale,
             init_cache,
             controlnet_temporal_smoothing,
+            depth_min=depth_min,
+            depth_max=depth_max,
         )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input

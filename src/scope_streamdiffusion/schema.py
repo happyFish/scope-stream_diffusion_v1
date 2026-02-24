@@ -59,6 +59,22 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=4, label="ControlNet Scale"),
     )
 
+    depth_min: float = Field(
+        default=0,
+        ge=0.0,
+        le=12.0,
+        description="Minimum depth value for ControlNet",
+        json_schema_extra=ui_field_config(order=5, label="Depth Min"),
+    )
+
+    depth_max: float = Field(
+        default=12,
+        ge=0.0,
+        le=12.0,
+        description="Maximum depth value for ControlNet",
+        json_schema_extra=ui_field_config(order=6, label="Depth Max"),
+    )
+
     controlnet_temporal_smoothing: float = Field(
         default=1.0,
         ge=0.0,
@@ -108,7 +124,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     strength: float = Field(
         default=0.99,
         ge=0.0,
-        le=1.2,
+        le=1.0,
         description="Denoising strength (how much to transform input)",
         json_schema_extra=ui_field_config(order=22, label="Strength"),
     )
