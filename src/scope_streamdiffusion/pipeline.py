@@ -298,15 +298,6 @@ class StreamDiffusionPipeline(Pipeline):
             )
             self._cached_base_embed = raw_embeds[0:1]  # store un-repeated (1, seq, dim)
             self._prompts_key = prompts_key
-            print("\nPrompt embeddings:")
-            print(f"  Shape: {self._cached_base_embed.shape}")
-            print(
-                f"  Range: [{self._cached_base_embed.min():.3f}, {self._cached_base_embed.max():.3f}]"
-            )
-            print(f"  Mean: {self._cached_base_embed.mean():.3f}")
-            print(
-                f"  Num prompts: {len(prompts)}, Method: {prompt_interpolation_method}"
-            )
 
         current_embeds = self._cached_base_embed.repeat(self.batch_size, 1, 1)
 
@@ -734,13 +725,6 @@ class StreamDiffusionPipeline(Pipeline):
 
     def _predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
         """Predict denoised latent from noisy latent."""
-        print("\n_predict_x0_batch:")
-        print(f"  Input latent shape: {x_t_latent.shape}")
-        print(f"  Input latent range: [{x_t_latent.min():.3f}, {x_t_latent.max():.3f}]")
-        print(f"  Denoising steps: {self.denoising_steps_num}")
-        print(f"  Use denoising batch: {self.use_denoising_batch}")
-        print(f"  Timesteps: {self.sub_timesteps}")
-
         added_cond_kwargs = {}
         prev_latent_batch = self.x_t_latent_buffer
 
@@ -830,10 +814,6 @@ class StreamDiffusionPipeline(Pipeline):
         Returns:
             dict: {"video": output_tensor} where output_tensor is (T, H, W, C) in [0, 1]
         """
-        print()
-        print("------------------")
-        print("Raw kwargs:", kwargs)
-
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
 
@@ -855,26 +835,17 @@ class StreamDiffusionPipeline(Pipeline):
             # Check if we stored it during init
             config = getattr(self, "config", None)
 
-        print(f"Config object: {config}")
-        print(f"Config type: {type(config)}")
-
-        if config:
-            print(f"Config attributes: {dir(config)}")
-
         # Helper to get value from config first, then kwargs, then default
         def get_param(key, default):
             # First check config if available (preferred source)
             if config and hasattr(config, key):
                 value = getattr(config, key)
-                print(f"  {key} from config: {value}")
                 return value
             # Then check kwargs directly
             if key in kwargs:
                 value = kwargs[key]
-                print(f"  {key} from kwargs: {value}")
                 return value
             # Finally use default
-            print(f"  {key} using default: {default}")
             return default
 
         # Extract all parameters with config fallback
@@ -914,12 +885,6 @@ class StreamDiffusionPipeline(Pipeline):
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
         self.controlnet_conditioning_scale = self._cn.scale
-
-        print(f"Extracted prompts: {prompts}")
-        print(
-            f"Parameters: steps={num_inference_steps}, strength={strength}, guidance={guidance_scale}, blend={prompt_interpolation_method}"
-        )
-
         # Extract transition (explicit transition overrides prompt-change detection)
         transition = kwargs.get("transition", None)
 
@@ -945,14 +910,8 @@ class StreamDiffusionPipeline(Pipeline):
         if image_loopback or (
             (video is None or len(video) == 0) and self.prev_image_result is not None
         ):
-            print("Using image loopback:")
             frame = self.prev_image_result
         elif video is not None and len(video) > 0:
-            print("Processing video input:")
-            print(f"  Video shape: {video[0].shape}")
-            print(f"  Video dtype: {video[0].dtype}")
-            print(f"  Video device: {video[0].device}")
-
             # Convert Scope tensor format to pipeline format
             # Scope: (T, H, W, C) in [0, 1] or [0, 255]
             # Pipeline needs: (B, C, H, W) in [0, 1]
@@ -965,7 +924,6 @@ class StreamDiffusionPipeline(Pipeline):
 
             # Convert from uint8 [0, 255] to float [0, 1] if needed
             if frame.dtype == torch.uint8:
-                print("  Converting from uint8 [0, 255] to float [0, 1]")
                 frame = frame.float() / 255.0
 
             # Move to device
@@ -1010,21 +968,10 @@ class StreamDiffusionPipeline(Pipeline):
 
         # Run diffusion
         x_0_pred_out = self._predict_x0_batch(input_latent)
-        print("\nAfter diffusion:")
-        print(f"  Latent shape: {x_0_pred_out.shape}")
-        print(f"  Latent range: [{x_0_pred_out.min():.3f}, {x_0_pred_out.max():.3f}]")
-
         # Decode to image space
         x_output = self._decode_image(x_0_pred_out).detach().clone()
-        print("\nAfter VAE decode (before normalization):")
-        print(f"  Image shape: {x_output.shape}")
-        print(f"  Image range: [{x_output.min():.3f}, {x_output.max():.3f}]")
-
         # Normalize from [-1, 1] to [0, 1] (VAE outputs in range [-1, 1])
         x_output = (x_output / 2 + 0.5).clamp(0, 1)
-        print("\nAfter normalization:")
-        print(f"  Image range: [{x_output.min():.3f}, {x_output.max():.3f}]")
-
         # Convert back to Scope format: (B, C, H, W) -> (T, H, W, C)
         output = x_output.permute(0, 2, 3, 1)
 
