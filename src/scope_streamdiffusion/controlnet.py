@@ -134,9 +134,7 @@ class ControlNetHandler:
                     .squeeze(0)
                 )
 
-            print(f"before clamp: d_min: {depth_norm.min()}, d_max: {depth_norm.max()}")
             depth_norm = torch.clamp(depth_norm, min=depth_min, max=depth_max)
-            print(f"after clamp: d_min: {depth_norm.min()}, d_max: {depth_norm.max()}")
 
             # (H, W) -> (1, 3, H, W), already on GPU
             self.input = (
