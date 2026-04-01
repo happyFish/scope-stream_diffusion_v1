@@ -94,20 +94,23 @@ class ControlNetHandler:
             if frame_np.dtype != np.uint8:
                 frame_np = (np.clip(frame_np, 0.0, 1.0) * 255).astype(np.uint8)
 
-            # return_tensor=True keeps depth on GPU — avoids an extra GPU→CPU→GPU roundtrip
-            depth_t, self._depth_hidden_state = (
+            # TODO: VideoDepthAnything.infer_video_depth_one() could accept a
+            # return_tensor=True kwarg to skip the internal .cpu().numpy() and return
+            # a GPU tensor directly, avoiding the roundtrip below.
+            depth_np, self._depth_hidden_state = (
                 self._get_depth_preprocessor().infer_video_depth_one(
                     frame_np,
                     input_size=518,
                     device="cuda" if self.device.type == "cuda" else "cpu",
                     fp32=False,
                     cached_hidden_state_list=self._depth_hidden_state,
-                    return_tensor=True,
                 )
-            )  # depth_t: (H, W) on self.device
+            )  # depth_np: (H, W) numpy float32 on CPU
+
+            # Move to GPU tensor for all subsequent operations
+            depth_t = torch.from_numpy(depth_np).to(device=self.device, dtype=torch.float32)
 
             # EMA on normalization bounds — prevents scale/contrast jumps between frames
-            # .min()/.max() are GPU scalars; extracting as Python floats for EMA arithmetic
             d_min, d_max = float(depth_t.min()), float(depth_t.max())
             if self._depth_min_ema is None:
                 self._depth_min_ema, self._depth_max_ema = d_min, d_max

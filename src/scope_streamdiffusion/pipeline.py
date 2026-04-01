@@ -146,6 +146,9 @@ class StreamDiffusionPipeline(Pipeline):
         self._prompts_key: tuple | None = None
         self._cached_base_embed: torch.Tensor | None = None  # (1, seq_len, hidden_dim)
 
+        # Mode-transition tracking — detect video↔text switches without a pipeline reload
+        self._last_mode: str | None = None
+
         print("StreamDiffusion pipeline initialized")
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
@@ -186,16 +189,15 @@ class StreamDiffusionPipeline(Pipeline):
             safe_fusing=safe_fusing,
         )
 
-    def prepare(self, **kwargs) -> Requirements:
-        """Specify pipeline requirements.
+    def prepare(self, **kwargs) -> "Requirements | None":
+        """Specify pipeline requirements based on current mode.
 
-        Returns:
-            Requirements: Pipeline requirements (e.g., input size)
+        Scope calls this with video=True sentinel when in video mode, and
+        without 'video' (or video=None) in text mode. Returns Requirements
+        with input_size=1 for video mode, None for text/generator mode.
         """
-        if kwargs.get("video") is not None:
-            return Requirements(input_size=1)
-        else:
-            None
+        from scope.core.pipelines.defaults import prepare_for_mode
+        return prepare_for_mode(self.__class__, {}, kwargs, video_input_size=1)
 
     def _prepare_runtime_state(
         self,
@@ -816,6 +818,16 @@ class StreamDiffusionPipeline(Pipeline):
         """
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
+
+        # Detect video↔text mode transitions and self-trigger a reset so stale
+        # ControlNet hidden states, EMA bounds, and prev_image_result don't bleed
+        # across mode boundaries.
+        from scope.core.pipelines.defaults import resolve_input_mode
+        current_mode = resolve_input_mode(kwargs)
+        if self._last_mode is not None and self._last_mode != current_mode:
+            kwargs = {**kwargs, "init_cache": True}
+            self.prev_image_result = None
+        self._last_mode = current_mode
 
         # Extract prompts array from Scope
         prompts = kwargs.get("prompts", [])

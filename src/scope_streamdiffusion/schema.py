@@ -25,8 +25,8 @@ class StreamDiffusionConfig(BasePipelineConfig):
 
     # Pipeline modes
     modes = {
-        "video": ModeDefaults(default=True),
-        "text": ModeDefaults(),
+        "text": ModeDefaults(default=True),
+        "video": ModeDefaults(height=512, width=512),
     }
 
     supports_lora = True
@@ -88,6 +88,20 @@ class StreamDiffusionConfig(BasePipelineConfig):
     # ========================================
     # Note: prompts array is handled by Scope's base when supports_prompts = True
 
+    negative_prompt: str = Field(
+        default="",
+        description="Negative prompt — what to avoid in the generated image",
+        json_schema_extra=ui_field_config(order=11, label="Negative Prompt"),
+    )
+
+    negative_prompt_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="Strength of embedding-space negative guidance (used when guidance_scale=0). Subtracts the negative prompt embedding from the positive. 0 = disabled, 1 = full subtraction.",
+        json_schema_extra=ui_field_config(order=12, label="Negative Scale"),
+    )
+
     prompt_interpolation_method: Literal["linear", "slerp"] = Field(
         default="linear",
         description="Method for blending multiple prompts spatially",
@@ -98,7 +112,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0,
         le=2147483647,
         description="Random seed for generation",
-        json_schema_extra=ui_field_config(order=12, label="Seed"),
+        json_schema_extra=ui_field_config(order=13, label="Seed"),
     )
 
     # ========================================

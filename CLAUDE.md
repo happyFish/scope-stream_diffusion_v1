@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Scope Plugin Expertise
+
+You are an expert at building Daydream Scope plugins/nodes/pipelines. Reference documentation:
+- **https://docs.daydream.live/scope/tutorials/build-video-effects-plugin**
+- **https://docs.daydream.live/scope/tutorials/vibe-code-a-scope-plugin**
+
 ## Project Overview
 
 This is a **Daydream Scope plugin** that integrates StreamDiffusion for real-time Stable Diffusion video generation. It's not a standalone application—it's designed to be installed and discovered by the Daydream Scope framework via Python entry points.
