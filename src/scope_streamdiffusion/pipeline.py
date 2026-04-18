@@ -87,6 +87,9 @@ class StreamDiffusionPipeline(Pipeline):
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
         self.vae = self.pipe.vae
+        self._full_vae = self.vae  # keep reference for toggling
+        self._taesd_vae = None
+        self._using_taesd = False
 
         # Check if SDXL
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
@@ -160,10 +163,41 @@ class StreamDiffusionPipeline(Pipeline):
                 variant="fp16" if self.dtype == torch.float16 else None,
             )
             pipe = pipe.to(self.device)
+
+            # Enable xformers memory-efficient attention if available.
+            # The schema declares acceleration="xformers" but this was never called.
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                print("[StreamDiffusion] xformers memory-efficient attention enabled")
+            except Exception as e:
+                print(f"[StreamDiffusion] xformers not available, skipping: {e}")
+
             return pipe
         except Exception as e:
             print(f"Failed to load model {model_id}: {e}")
             raise
+
+    def _set_taesd(self, enabled: bool) -> None:
+        """Switch between TAESD (fast) and full VAE decoder."""
+        if enabled == self._using_taesd:
+            return
+        if enabled:
+            if self._taesd_vae is None:
+                from diffusers import AutoencoderTiny
+
+                taesd_id = "madebyollin/taesdxl" if self.sdxl else "madebyollin/taesd"
+                print(f"[StreamDiffusion] Loading TAESD from {taesd_id}")
+                self._taesd_vae = AutoencoderTiny.from_pretrained(
+                    taesd_id, torch_dtype=self.dtype
+                ).to(self.device)
+                print("[StreamDiffusion] TAESD loaded")
+            self.vae = self._taesd_vae
+            self._using_taesd = True
+            print("[StreamDiffusion] Switched to TAESD (fast decode)")
+        else:
+            self.vae = self._full_vae
+            self._using_taesd = False
+            print("[StreamDiffusion] Switched to full VAE")
 
     def load_lora(
         self,
@@ -197,7 +231,8 @@ class StreamDiffusionPipeline(Pipeline):
         with input_size=1 for video mode, None for text/generator mode.
         """
         from scope.core.pipelines.defaults import prepare_for_mode
-        return prepare_for_mode(self.__class__, {}, kwargs, video_input_size=1)
+        req = prepare_for_mode(self.__class__, {}, kwargs, video_input_size=1)
+        return req
 
     def _prepare_runtime_state(
         self,
@@ -866,11 +901,11 @@ class StreamDiffusionPipeline(Pipeline):
 
         # SD Turbo: Use single timestep (t_index_list=[0]) but set schedule length
         # This matches your working project setup
-        num_inference_steps = get_param("num_inference_steps", 25)
+        num_inference_steps = get_param("num_inference_steps", 3)
 
         # For img2img with SD Turbo, need higher strength for visible changes
         # 0.5-0.7 = moderate, 0.8-0.95 = heavy transformation
-        strength = get_param("strength", 0.8)
+        strength = get_param("strength", 0.9)
 
         seed = get_param("seed", 42)
         delta = get_param("delta", 1.0)
@@ -886,6 +921,11 @@ class StreamDiffusionPipeline(Pipeline):
         init_cache = kwargs.get("init_cache", False)
         depth_min = get_param("depth_min", 0)
         depth_max = get_param("depth_max", 12)
+        depth_skip_interval = get_param("depth_skip_interval", 3)
+        use_taesd = get_param("use_taesd", False)
+
+        # Toggle TAESD/full VAE based on runtime param
+        self._set_taesd(use_taesd)
 
         self._cn.update(
             controlnet_mode,
@@ -897,6 +937,7 @@ class StreamDiffusionPipeline(Pipeline):
             controlnet_temporal_smoothing,
             depth_min=depth_min,
             depth_max=depth_max,
+            depth_skip_interval=depth_skip_interval,
         )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
@@ -948,16 +989,15 @@ class StreamDiffusionPipeline(Pipeline):
             # Get actual dimensions after squeezing
             actual_height, actual_width = frame.shape[0], frame.shape[1]
 
-            # Resize if needed
+            # Resize if needed — stay on GPU to avoid the CPU↔PIL roundtrip
             if actual_height != height or actual_width != width:
-                # Convert to PIL for resizing
-                frame_np = (frame.cpu().numpy() * 255).astype(np.uint8)
-                # Squeeze any remaining extra dimensions for PIL
-                frame_np = frame_np.squeeze()
-                frame_pil = PIL.Image.fromarray(frame_np)
-                frame_pil = frame_pil.resize((width, height))
-                frame = torch.from_numpy(np.array(frame_pil)).float() / 255.0
-                frame = frame.to(device=self.device, dtype=self.dtype)
+                # (H, W, C) -> (1, C, H, W) for F.interpolate
+                frame = frame.permute(2, 0, 1).unsqueeze(0)
+                frame = torch.nn.functional.interpolate(
+                    frame, size=(height, width), mode="bilinear", align_corners=False
+                )
+                # (1, C, H, W) -> (H, W, C)
+                frame = frame.squeeze(0).permute(1, 2, 0)
 
             # Convert HWC -> CHW and add batch dimension: (H, W, C) -> (1, C, H, W)
             input_tensor = frame.permute(2, 0, 1).unsqueeze(0)

@@ -51,6 +51,10 @@ class ControlNetHandler:
         self._scribble_model = None
         self._prev_scribble_input: torch.Tensor | None = None
 
+        # Depth frame-skipping: reuse cached depth every N frames to save 20-40ms/frame
+        self._depth_frame_counter: int = 0
+        self._depth_skip_interval: int = 3  # run depth every Nth frame
+
         self.model: Optional[ControlNetModel] = None
         self.input: Optional[torch.Tensor] = None
         self.scale: float = 1.0
@@ -66,6 +70,7 @@ class ControlNetHandler:
         temporal_smoothing: float = 1.0,
         depth_min: float = 0,
         depth_max: float = 12,
+        depth_skip_interval: int = 3,
     ) -> None:
         """Update ControlNet state for the current frame.
 
@@ -76,10 +81,13 @@ class ControlNetHandler:
             temporal_smoothing: Weight of the current frame in the blend with the
                 previous conditioning map. 1.0 = no smoothing (lowest latency),
                 0.0 = fully smoothed (previous frame only).
+            depth_skip_interval: Run depth model every Nth frame; reuse cached
+                depth map on intermediate frames to save 20-40ms/frame.
         """
         self.model = None
         self.input = None
         self.scale = scale
+        self._depth_skip_interval = max(1, depth_skip_interval)
 
         if mode == "depth" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("depth")
@@ -89,71 +97,88 @@ class ControlNetHandler:
                 self._depth_min_ema = None
                 self._depth_max_ema = None
                 self._prev_depth_input = None
+                self._depth_frame_counter = 0
 
-            frame_np = video[0].squeeze(0).cpu().numpy()
-            if frame_np.dtype != np.uint8:
-                frame_np = (np.clip(frame_np, 0.0, 1.0) * 255).astype(np.uint8)
-
-            # TODO: VideoDepthAnything.infer_video_depth_one() could accept a
-            # return_tensor=True kwarg to skip the internal .cpu().numpy() and return
-            # a GPU tensor directly, avoiding the roundtrip below.
-            depth_np, self._depth_hidden_state = (
-                self._get_depth_preprocessor().infer_video_depth_one(
-                    frame_np,
-                    input_size=518,
-                    device="cuda" if self.device.type == "cuda" else "cpu",
-                    fp32=False,
-                    cached_hidden_state_list=self._depth_hidden_state,
-                )
-            )  # depth_np: (H, W) numpy float32 on CPU
-
-            # Move to GPU tensor for all subsequent operations
-            depth_t = torch.from_numpy(depth_np).to(device=self.device, dtype=torch.float32)
-
-            # EMA on normalization bounds — prevents scale/contrast jumps between frames
-            d_min, d_max = float(depth_t.min()), float(depth_t.max())
-            if self._depth_min_ema is None:
-                self._depth_min_ema, self._depth_max_ema = d_min, d_max
-            else:
-                a = 0.1  # lower = smoother bounds, higher = more responsive
-                self._depth_min_ema = a * d_min + (1 - a) * self._depth_min_ema
-                self._depth_max_ema = a * d_max + (1 - a) * self._depth_max_ema
-            rng = self._depth_max_ema - self._depth_min_ema
-            depth_norm = (
-                ((depth_t - self._depth_min_ema) / rng).clamp(0.0, 1.0)
-                if rng > 0
-                else torch.zeros_like(depth_t)
+            # Frame-skipping: reuse cached depth on non-key frames
+            self._depth_frame_counter += 1
+            run_depth = (
+                self._prev_depth_input is None
+                or self._depth_frame_counter >= self._depth_skip_interval
             )
 
-            if depth_norm.shape != (height, width):
-                depth_norm = (
-                    F.interpolate(
-                        depth_norm.unsqueeze(0).unsqueeze(0),
-                        size=(height, width),
-                        mode="bilinear",
-                        align_corners=True,
+            if run_depth:
+                self._depth_frame_counter = 0
+
+                # Prepare input — stay on GPU as much as possible
+                frame_t = video[0].squeeze(0)  # (H, W, C) tensor
+                if frame_t.dtype == torch.uint8:
+                    frame_np = frame_t.cpu().numpy()
+                else:
+                    frame_np = (frame_t.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+
+                # TODO: VideoDepthAnything.infer_video_depth_one() could accept a
+                # return_tensor=True kwarg to skip the internal .cpu().numpy() and return
+                # a GPU tensor directly, avoiding the roundtrip below.
+                depth_np, self._depth_hidden_state = (
+                    self._get_depth_preprocessor().infer_video_depth_one(
+                        frame_np,
+                        input_size=518,
+                        device="cuda" if self.device.type == "cuda" else "cpu",
+                        fp32=False,
+                        cached_hidden_state_list=self._depth_hidden_state,
                     )
-                    .squeeze(0)
-                    .squeeze(0)
+                )  # depth_np: (H, W) numpy float32 on CPU
+
+                # Move to GPU tensor for all subsequent operations
+                depth_t = torch.from_numpy(depth_np).to(device=self.device, dtype=torch.float32)
+
+                # EMA on normalization bounds — prevents scale/contrast jumps between frames
+                d_min, d_max = float(depth_t.min()), float(depth_t.max())
+                if self._depth_min_ema is None:
+                    self._depth_min_ema, self._depth_max_ema = d_min, d_max
+                else:
+                    a = 0.1  # lower = smoother bounds, higher = more responsive
+                    self._depth_min_ema = a * d_min + (1 - a) * self._depth_min_ema
+                    self._depth_max_ema = a * d_max + (1 - a) * self._depth_max_ema
+                rng = self._depth_max_ema - self._depth_min_ema
+                depth_norm = (
+                    ((depth_t - self._depth_min_ema) / rng).clamp(0.0, 1.0)
+                    if rng > 0
+                    else torch.zeros_like(depth_t)
                 )
 
-            depth_norm = torch.clamp(depth_norm, min=depth_min, max=depth_max)
+                if depth_norm.shape != (height, width):
+                    depth_norm = (
+                        F.interpolate(
+                            depth_norm.unsqueeze(0).unsqueeze(0),
+                            size=(height, width),
+                            mode="bilinear",
+                            align_corners=True,
+                        )
+                        .squeeze(0)
+                        .squeeze(0)
+                    )
 
-            # (H, W) -> (1, 3, H, W), already on GPU
-            self.input = (
-                depth_norm.to(dtype=self.dtype)
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .repeat(1, 3, 1, 1)
-            )
+                depth_norm = torch.clamp(depth_norm, min=depth_min, max=depth_max)
 
-            # Output blending — catches residual pixel-level flicker after bounds stabilization
-            if self._prev_depth_input is not None and temporal_smoothing < 1.0:
+                # (H, W) -> (1, 3, H, W), already on GPU
                 self.input = (
-                    temporal_smoothing * self.input
-                    + (1 - temporal_smoothing) * self._prev_depth_input
+                    depth_norm.to(dtype=self.dtype)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .repeat(1, 3, 1, 1)
                 )
-            self._prev_depth_input = self.input
+
+                # Output blending — catches residual pixel-level flicker after bounds stabilization
+                if self._prev_depth_input is not None and temporal_smoothing < 1.0:
+                    self.input = (
+                        temporal_smoothing * self.input
+                        + (1 - temporal_smoothing) * self._prev_depth_input
+                    )
+                self._prev_depth_input = self.input
+            else:
+                # Reuse cached depth from previous key frame
+                self.input = self._prev_depth_input
 
         elif mode == "scribble" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("scribble")

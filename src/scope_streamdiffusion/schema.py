@@ -45,6 +45,12 @@ class StreamDiffusionConfig(BasePipelineConfig):
         description="Hardware acceleration method",
     )
 
+    use_taesd: bool = Field(
+        default=False,
+        description="Use Tiny AutoEncoder (TAESD) for ~10x faster VAE decoding at slight quality cost",
+        json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
+    )
+
     controlnet_mode: Literal["none", "depth", "scribble"] = Field(
         default="none",
         description="ControlNet conditioning mode. 'depth' runs Video Depth Anything internally and routes the depth map to ControlNet. First switch to a new mode stalls while the model loads.",
@@ -73,6 +79,14 @@ class StreamDiffusionConfig(BasePipelineConfig):
         le=1,
         description="Maximum depth value for ControlNet",
         json_schema_extra=ui_field_config(order=6, label="Depth Max"),
+    )
+
+    depth_skip_interval: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Run depth model every Nth frame; reuse cached depth map on intermediate frames. Higher = less GPU cost, more temporal lag.",
+        json_schema_extra=ui_field_config(order=7, label="Depth Skip Interval"),
     )
 
     controlnet_temporal_smoothing: float = Field(
