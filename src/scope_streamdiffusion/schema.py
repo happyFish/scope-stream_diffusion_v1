@@ -46,7 +46,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     use_taesd: bool = Field(
-        default=False,
+        default=True,
         description="Use Tiny AutoEncoder (TAESD) for ~10x faster VAE decoding at slight quality cost",
         json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
     )
