@@ -11,6 +11,10 @@ import torch
 import torch.nn.functional as F
 from diffusers import ControlNetModel
 
+# Whether the Scope VideoDepthAnything has the GPU-native infer_depth_tensor() method.
+# Detected at runtime on first depth call.
+_HAS_GPU_DEPTH: bool | None = None
+
 # ControlNet model IDs keyed by controlnet_mode
 MODEL_IDS: dict[str, str] = {
     "depth": "https://huggingface.co/thibaud/controlnet-sd21/resolve/main/control_v11p_sd21_depth.safetensors",
@@ -109,28 +113,7 @@ class ControlNetHandler:
             if run_depth:
                 self._depth_frame_counter = 0
 
-                # Prepare input — stay on GPU as much as possible
-                frame_t = video[0].squeeze(0)  # (H, W, C) tensor
-                if frame_t.dtype == torch.uint8:
-                    frame_np = frame_t.cpu().numpy()
-                else:
-                    frame_np = (frame_t.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-
-                # TODO: VideoDepthAnything.infer_video_depth_one() could accept a
-                # return_tensor=True kwarg to skip the internal .cpu().numpy() and return
-                # a GPU tensor directly, avoiding the roundtrip below.
-                depth_np, self._depth_hidden_state = (
-                    self._get_depth_preprocessor().infer_video_depth_one(
-                        frame_np,
-                        input_size=518,
-                        device="cuda" if self.device.type == "cuda" else "cpu",
-                        fp32=False,
-                        cached_hidden_state_list=self._depth_hidden_state,
-                    )
-                )  # depth_np: (H, W) numpy float32 on CPU
-
-                # Move to GPU tensor for all subsequent operations
-                depth_t = torch.from_numpy(depth_np).to(device=self.device, dtype=torch.float32)
+                depth_t = self._run_depth_inference(video[0])
 
                 # EMA on normalization bounds — prevents scale/contrast jumps between frames
                 d_min, d_max = float(depth_t.min()), float(depth_t.max())
@@ -253,6 +236,87 @@ class ControlNetHandler:
             self._depth_model = model.to(device=self.device).half().eval()
             print("[Depth] Model loaded")
         return self._depth_model
+
+    def _run_depth_inference(self, frame: torch.Tensor) -> torch.Tensor:
+        """Run depth inference on a single frame, preferring the GPU-native path.
+
+        Tries infer_depth_tensor() first (zero CPU roundtrips). Falls back to the
+        legacy infer_video_depth_one() with return_tensor=True, and finally to the
+        numpy path if neither is available.
+
+        Args:
+            frame: (T, H, W, C) or (H, W, C) tensor from the video input.
+
+        Returns:
+            depth_t: (H, W) float32 tensor on self.device.
+        """
+        global _HAS_GPU_DEPTH
+
+        frame_t = frame.squeeze(0)  # (H, W, C)
+        depth_model = self._get_depth_preprocessor()
+        device_str = "cuda" if self.device.type == "cuda" else "cpu"
+
+        # Detect GPU-native support on first call
+        if _HAS_GPU_DEPTH is None:
+            _HAS_GPU_DEPTH = hasattr(depth_model, "infer_depth_tensor")
+            if _HAS_GPU_DEPTH:
+                print("[Depth] Using GPU-native infer_depth_tensor() path")
+            else:
+                print("[Depth] GPU-native path not available, using legacy path")
+
+        if _HAS_GPU_DEPTH:
+            # GPU-native path: keep everything on GPU
+            if frame_t.dtype == torch.uint8:
+                frame_gpu = frame_t.float() / 255.0
+            else:
+                frame_gpu = frame_t.clamp(0.0, 1.0)
+            # (H, W, C) -> (1, C, H, W)
+            frame_bchw = frame_gpu.to(
+                device=self.device, dtype=torch.float32
+            ).permute(2, 0, 1).unsqueeze(0)
+
+            depth_t, self._depth_hidden_state = depth_model.infer_depth_tensor(
+                frame_bchw,
+                input_size=518,
+                fp32=False,
+                cached_hidden_state_list=self._depth_hidden_state,
+            )
+            return depth_t  # (H, W) on GPU
+        else:
+            # Legacy path: CPU roundtrip via numpy
+            if frame_t.dtype == torch.uint8:
+                frame_np = frame_t.cpu().numpy()
+            else:
+                frame_np = (frame_t.clamp(0.0, 1.0).cpu().numpy() * 255).astype(
+                    np.uint8
+                )
+
+            # Try return_tensor=True first (available with updated Scope)
+            try:
+                depth_t, self._depth_hidden_state = depth_model.infer_video_depth_one(
+                    frame_np,
+                    input_size=518,
+                    device=device_str,
+                    fp32=False,
+                    cached_hidden_state_list=self._depth_hidden_state,
+                    return_tensor=True,
+                )
+                if isinstance(depth_t, torch.Tensor):
+                    return depth_t.to(device=self.device, dtype=torch.float32)
+            except TypeError:
+                pass
+
+            # Oldest path: numpy roundtrip
+            depth_np, self._depth_hidden_state = depth_model.infer_video_depth_one(
+                frame_np,
+                input_size=518,
+                device=device_str,
+                fp32=False,
+                cached_hidden_state_list=self._depth_hidden_state,
+            )
+            return torch.from_numpy(depth_np).to(
+                device=self.device, dtype=torch.float32
+            )
 
     def _get_scribble_preprocessor(self):
         if self._scribble_model is None:
