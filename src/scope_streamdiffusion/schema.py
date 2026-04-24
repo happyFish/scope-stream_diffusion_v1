@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
+    InputMode,
     ModeDefaults,
     ui_field_config,
 )
@@ -30,6 +31,22 @@ class StreamDiffusionConfig(BasePipelineConfig):
     }
 
     supports_lora = True
+
+    # ========================================
+    # Pipeline Control
+    # ========================================
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable pipeline processing. When disabled, input video is passed through unchanged.",
+        json_schema_extra=ui_field_config(order=0, label="Enabled"),
+    )
+
+    input_mode: InputMode = Field(
+        default="text",
+        description="Input mode: 'text' generates from prompts only, 'video' transforms input frames",
+        json_schema_extra=ui_field_config(order=1, label="Input Mode"),
+    )
 
     # ========================================
     # Model Configuration
@@ -118,7 +135,19 @@ class StreamDiffusionConfig(BasePipelineConfig):
 
     prompt_interpolation_method: Literal["linear", "slerp"] = Field(
         default="linear",
-        description="Method for blending multiple prompts spatially",
+        description="Method for blending multiple prompts spatially (and temporally when transition_steps > 0)",
+    )
+
+    transition_steps: int = Field(
+        default=0,
+        ge=0,
+        le=240,
+        description=(
+            "Auto-transition over this many frames whenever prompts change. "
+            "0 = hard cut (can cause garbage frames); 8-30 is typical for smooth "
+            "prompt morphs. Ignored when an explicit transition dict is sent."
+        ),
+        json_schema_extra=ui_field_config(order=10, label="Transition Steps"),
     )
 
     seed: int = Field(
