@@ -492,6 +492,21 @@ class StreamDiffusionPipeline(Pipeline):
             target_prompts, interpolation_method, width, height
         )
 
+        # Slerp is not supported here: upstream EmbeddingBlender.slerp runs
+        # torch.acos on the native dtype; at fp16 the [-1, 1] clamp isn't
+        # enough to prevent acos(1.0) → NaN at certain token positions, which
+        # nukes the whole conditioning tensor. Until that's fixed upstream,
+        # fall back to linear and warn once.
+        if temporal_method == "slerp":
+            if not getattr(self, "_slerp_fallback_warned", False):
+                print(
+                    "[StreamDiffusion] slerp temporal interpolation is not "
+                    "supported (fp16 NaN in upstream blender); falling back "
+                    "to linear."
+                )
+                self._slerp_fallback_warned = True
+            temporal_method = "linear"
+
         self.embedding_blender.start_transition(
             source_embedding=source_embedding,
             target_embedding=target_embed_single,
