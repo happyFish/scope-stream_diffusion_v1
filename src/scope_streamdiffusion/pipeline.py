@@ -1161,14 +1161,6 @@ class StreamDiffusionPipeline(Pipeline):
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
 
-        # Hot-swap the model when the runtime kwarg disagrees with what's
-        # loaded. Scope sends model_id_or_path through setNodeParams, not
-        # through pipeline/load, so this is the only place a UI-driven model
-        # change actually takes effect.
-        requested_model = kwargs.get("model_id_or_path") or kwargs.get("model_id")
-        if requested_model and requested_model != self.model_id:
-            self._swap_model(requested_model)
-
         # Bypass: pass input through unchanged when disabled
         enabled = kwargs.get("enabled", True)
         if not enabled:
@@ -1224,6 +1216,14 @@ class StreamDiffusionPipeline(Pipeline):
                 return value
             # Finally use default
             return default
+
+        # Hot-swap when the model selection changes at runtime. Scope routes
+        # model_id_or_path through setNodeParams (kwargs / config), not
+        # through pipeline/load — so this is the only spot where a UI-driven
+        # change actually takes effect.
+        requested_model = get_param("model_id_or_path", None)
+        if requested_model and requested_model != self.model_id:
+            self._swap_model(requested_model)
 
         # Extract all parameters with config fallback
         prompt_interpolation_method = get_param("prompt_interpolation_method", "linear")
