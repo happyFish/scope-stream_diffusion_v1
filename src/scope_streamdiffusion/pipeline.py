@@ -208,6 +208,64 @@ class StreamDiffusionPipeline(Pipeline):
             print(f"Failed to load model {model_id}: {e}")
             raise
 
+    def _swap_model(self, new_model_id: str) -> None:
+        """Replace the loaded model in place.
+
+        Scope routes ``model_id_or_path`` through both the load-time path
+        (which would reinit the pipeline cleanly) and the runtime
+        ``setNodeParams`` path (which only updates kwargs and never touches
+        ``__init__``). When the runtime kwarg disagrees with what we loaded,
+        rebuild the model parts here so picking a model in the UI actually
+        swaps it. Stalls the frame loop while loading — same as a fresh load.
+        """
+        print(f"[StreamDiffusion] Swapping model: {self.model_id} -> {new_model_id}")
+        # Free the current model's GPU memory before bringing the next one in
+        # so we don't peak at 2x weights.
+        old = getattr(self, "pipe", None)
+        if old is not None:
+            del old
+        self.pipe = None
+        self._taesd_vae = None
+        self._full_vae = None
+        torch.cuda.empty_cache()
+
+        self.model_id = new_model_id
+        self.sd_turbo = "turbo" in new_model_id.lower()
+        self.pipe = self._load_model(new_model_id)
+        print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
+        self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
+        if self.sdxl and self.dtype == torch.float16:
+            self._install_sdxl_fp16_vae()
+        if not self.sd_turbo:
+            self._attach_lcm_lora()
+
+        self.text_encoder = self.pipe.text_encoder
+        self.unet = self.pipe.unet
+        self.vae = self.pipe.vae
+        self._full_vae = self.vae
+        self._using_taesd = False
+        self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+        self.image_processor = VaeImageProcessor(self.pipe.vae_scale_factor)
+
+        # Invalidate runtime caches so the next __call__ rebuilds prompt
+        # embeddings, timestep schedule, and noise buffers against the new
+        # model — text encoder + UNet config differ between SD1.5 and SDXL.
+        self._schedule_key = None
+        self._noise_shape = None
+        self._prompts_key = None
+        self._cached_base_embed = None
+        self._previous_prompt_embeddings = None
+        self.prev_image_result = None
+        self._last_transition_id = None
+        self._pooled_source = None
+        self._pooled_target = None
+        self._transition_total_steps = 0
+        if hasattr(self, "embedding_blender"):
+            try:
+                self.embedding_blender.cancel_transition()
+            except Exception:
+                pass
+
     def _install_sdxl_fp16_vae(self) -> None:
         """Swap SDXL's default VAE for madebyollin/sdxl-vae-fp16-fix.
 
@@ -1102,6 +1160,14 @@ class StreamDiffusionPipeline(Pipeline):
         """
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
+
+        # Hot-swap the model when the runtime kwarg disagrees with what's
+        # loaded. Scope sends model_id_or_path through setNodeParams, not
+        # through pipeline/load, so this is the only place a UI-driven model
+        # change actually takes effect.
+        requested_model = kwargs.get("model_id_or_path") or kwargs.get("model_id")
+        if requested_model and requested_model != self.model_id:
+            self._swap_model(requested_model)
 
         # Bypass: pass input through unchanged when disabled
         enabled = kwargs.get("enabled", True)
