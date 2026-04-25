@@ -1137,6 +1137,63 @@ class StreamDiffusionPipeline(Pipeline):
         return x_0_pred_out
 
     @torch.no_grad()
+    def _predict_x0_serial(
+        self,
+        latent: torch.Tensor,
+        num_inference_steps: int,
+        strength: float = 1.0,
+        is_img2img: bool = False,
+    ) -> torch.Tensor:
+        """Run a clean N-step LCM denoise loop on a single latent.
+
+        Sibling of :meth:`_predict_x0_batch` for modes where the streaming
+        rolling-buffer trick gets in the way (steady-prompt txt2img and
+        image-loopback) — runs all N timesteps inside one call so the output
+        is a single fully-denoised frame, not one slice of a 4-track buffer
+        cycle.
+
+        For txt2img, ``latent`` is pure noise and we walk every timestep in
+        the schedule. For img2img / loopback, ``latent`` is the cleanly-
+        encoded input image; we add fresh noise at the first timestep we
+        actually run, controlled by ``strength`` (1.0 = full repaint, lower
+        = preserve more of the input).
+        """
+        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        if is_img2img:
+            skip = max(0, int(round(num_inference_steps * (1.0 - strength))))
+            timesteps = timesteps[skip:]
+            if len(timesteps) == 0:
+                return latent
+            noise = torch.randn(
+                latent.shape, generator=self.generator,
+                device=self.device, dtype=self.dtype,
+            )
+            latent = self.scheduler.add_noise(latent, noise, timesteps[:1])
+
+        added_cond_kwargs = {}
+        if self.sdxl:
+            added_cond_kwargs = {
+                "text_embeds": self.add_text_embeds.to(self.device),
+                "time_ids": self.add_time_ids.to(self.device),
+            }
+
+        prompt_embeds = self.prompt_embeds[:1]  # serial works one frame at a time
+        for t in timesteps:
+            noise_pred = self.unet(
+                latent,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs=added_cond_kwargs,
+                return_dict=False,
+            )[0]
+            latent = self.scheduler.step(
+                noise_pred, t, latent, return_dict=False
+            )[0]
+        return latent
+
+    @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
         """Process input video frame(s) and return generated output.
 
@@ -1258,6 +1315,30 @@ class StreamDiffusionPipeline(Pipeline):
         depth_skip_interval = get_param("depth_skip_interval", 3)
         use_taesd = get_param("use_taesd", False)
 
+        # --- Pick denoise path -------------------------------------------------
+        # The batch path (StreamDiffusion's rolling-buffer trick) amortises N
+        # denoising stages across N consecutive video frames. That's a real
+        # win when the input stream changes every frame (webcam, v2v, moving
+        # ControlNet) but in steady-prompt txt2img / image-loopback the per-
+        # slot init_noise drift makes the N buffer slots crystallise into N
+        # different attractors that flash one after another.
+        # Use the serial path for those cases; keep the batch path everywhere
+        # else and at num_inference_steps=1 (where it degenerates to one
+        # UNet call per frame anyway).
+        has_video_input_eval = video is not None and len(video) > 0
+        is_steady_prompt_mode = (not has_video_input_eval) or image_loopback
+        use_serial = (
+            num_inference_steps > 1
+            and is_steady_prompt_mode
+            and controlnet_mode == "none"
+        )
+        if use_serial:
+            # Serial denoise wants prompt_embeds sized for batch=1 and doesn't
+            # care about the LCM coefficient pre-compute. Force the runtime
+            # state into a 1-track configuration so _prepare_runtime_state's
+            # caches match what _predict_x0_serial will read.
+            use_denoising_batch = False
+
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
         # LCM scheduler requires: floor(original_steps * strength) >= num_inference_steps
         # original_steps defaults to 50 in the scheduler.
@@ -1367,8 +1448,9 @@ class StreamDiffusionPipeline(Pipeline):
                     return {"video": output.permute(0, 2, 3, 1).clamp(0, 1)}
                 input_tensor = filtered
 
-            # Encode to latent space
-            input_latent = self._encode_image(input_tensor)
+            # Encode to latent space. Serial img2img adds its own noise based
+            # on the requested strength, so don't double-noise here.
+            input_latent = self._encode_image(input_tensor, add_noise=not use_serial)
 
         else:
             # Text-to-image mode — use the seeded `init_noise` instead of a
@@ -1379,7 +1461,15 @@ class StreamDiffusionPipeline(Pipeline):
             input_latent = self.init_noise[0:1].clone()
 
         # Run diffusion
-        x_0_pred_out = self._predict_x0_batch(input_latent)
+        if use_serial:
+            x_0_pred_out = self._predict_x0_serial(
+                input_latent,
+                num_inference_steps=num_inference_steps,
+                strength=strength,
+                is_img2img=frame is not None,
+            )
+        else:
+            x_0_pred_out = self._predict_x0_batch(input_latent)
         # Decode to image space
         x_output = self._decode_image(x_0_pred_out).detach().clone()
         # Normalize from [-1, 1] to [0, 1] (VAE outputs in range [-1, 1])
