@@ -56,7 +56,8 @@ class StreamDiffusionPipeline(Pipeline):
     def __init__(
         self,
         device: Optional[torch.device] = None,
-        model_id: str = "stabilityai/sd-turbo",
+        model_id: Optional[str] = None,
+        model_id_or_path: Optional[str] = None,
         torch_dtype: torch.dtype = torch.float16,
         **kwargs,  # noqa: ARG002
     ) -> None:
@@ -64,7 +65,9 @@ class StreamDiffusionPipeline(Pipeline):
 
         Args:
             device: Torch device to use
-            model_id: Model ID or path to load
+            model_id / model_id_or_path: Model ID or path to load. The schema
+                field is ``model_id_or_path``; ``model_id`` is accepted as an
+                alias so older callers keep working.
             torch_dtype: Data type for tensors
         """
         self.device = (
@@ -77,6 +80,13 @@ class StreamDiffusionPipeline(Pipeline):
         # Store config if Scope passes it
         self.config = kwargs.get("config") or kwargs.get("pipeline_config")
         print(f"Init - Config object: {self.config}")
+
+        # The schema's field is ``model_id_or_path``. Scope's pipeline_manager
+        # merges schema defaults into the init kwargs by their declared name,
+        # so we have to accept that spelling — accepting only ``model_id``
+        # silently drops the user's selection and reloads the default every
+        # time. Resolve in order: explicit model_id > model_id_or_path > default.
+        model_id = model_id or model_id_or_path or "stabilityai/sd-turbo"
 
         # Load the base model
         print(f"Loading model: {model_id}")
