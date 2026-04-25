@@ -1158,6 +1158,7 @@ class StreamDiffusionPipeline(Pipeline):
         Returns:
             dict: {"video": output_tensor} where output_tensor is (T, H, W, C) in [0, 1]
         """
+        print('.....')
         # Extract parameters - handle Scope's parameter format
         video = kwargs.get("video", None)
 
@@ -1198,6 +1199,9 @@ class StreamDiffusionPipeline(Pipeline):
         # Get config instance - Scope should pass this
         # Try different ways Scope might pass config
         config = kwargs.get("config") or kwargs.get("pipeline_config")
+        
+        print(config)
+        print(kwargs)
 
         # If no config found, try to get it from the pipeline
         if config is None:
@@ -1222,6 +1226,7 @@ class StreamDiffusionPipeline(Pipeline):
         # through pipeline/load — so this is the only spot where a UI-driven
         # change actually takes effect.
         requested_model = get_param("model_id_or_path", None)
+        print(f"Requested model: {requested_model}, current model: {self.model_id}")
         if requested_model and requested_model != self.model_id:
             self._swap_model(requested_model)
 
@@ -1247,6 +1252,16 @@ class StreamDiffusionPipeline(Pipeline):
         height = get_param("height", 512)
         use_denoising_batch = get_param("use_denoising_batch", True)
         do_add_noise = get_param("do_add_noise", True)
+
+        # Batch denoising is StreamDiffusion's streaming-video trick: each
+        # __call__ returns one frame at a different denoising stage in the
+        # cycle (frame i at t_index i mod N). Across consecutive video frames
+        # that smooths out; in steady-prompt txt2img it shows up as N
+        # distinct outputs flashing in sequence. Run sequential denoising
+        # (all N steps inside one __call__ -> one fully denoised frame) when
+        # there's no video input and the schedule has more than one step.
+        if (video is None or len(video) == 0) and num_inference_steps > 1:
+            use_denoising_batch = False
         similar_image_filter_enabled = get_param("similar_image_filter_enabled", False)
         image_loopback = get_param("image_loopback", False)
         controlnet_mode = get_param("controlnet_mode", "none")
