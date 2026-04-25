@@ -52,9 +52,17 @@ class StreamDiffusionConfig(BasePipelineConfig):
     # Model Configuration
     # ========================================
 
-    model_id_or_path: str = Field(
+    model_id_or_path: Literal[
+        "stabilityai/sd-turbo",
+        "stabilityai/sdxl-turbo",
+        "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        "Lykon/dreamshaper-8",
+        "Lykon/dreamshaper-xl-v2-turbo",
+    ] = Field(
         default="stabilityai/sd-turbo",
-        description="Model ID from HuggingFace or local path to model",
+        description="HuggingFace model ID. Tested set; non-Turbo entries auto-attach the matching LCM LoRA, SDXL entries auto-swap to madebyollin/sdxl-vae-fp16-fix.",
+        json_schema_extra=ui_field_config(order=8, label="Model"),
     )
 
     acceleration: Literal["none", "xformers", "tensorrt"] = Field(
