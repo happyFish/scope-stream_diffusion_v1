@@ -171,11 +171,17 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     num_inference_steps: int = Field(
-        default=2,
+        default=4,
         ge=1,
         le=50,
-        description="Number of denoising steps",
-        # json_schema_extra=ui_field_config(order=21, label="Inference Steps"),
+        description="Number of LCM denoising steps. Main sharpness lever: more steps = sharper detail. SD-Turbo (sd-turbo) is distilled for 1 step; SDXL-Turbo / fine-tunes / non-turbo + LCM LoRA all want 4–8.",
+        json_schema_extra=ui_field_config(order=21, label="Inference Steps"),
+    )
+
+    use_suggested_num_inference_steps: bool = Field(
+        default=True,
+        description="When ON, the pipeline picks the inference-step count per model family (1 for SD-Turbo, 4 for everything else) and ignores the slider. Toggle OFF to drive the slider yourself.",
+        json_schema_extra=ui_field_config(order=22, label="Auto Inference Steps"),
     )
 
     strength: float = Field(

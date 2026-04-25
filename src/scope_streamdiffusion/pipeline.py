@@ -80,19 +80,32 @@ class StreamDiffusionPipeline(Pipeline):
 
         # Load the base model
         print(f"Loading model: {model_id}")
+        self.model_id = model_id
+        self.sd_turbo = "turbo" in model_id.lower()
         self.pipe = self._load_model(model_id)
         print(f"Model loaded: {self.pipe.__class__.__name__}")
 
-        # Model components
+        # Check if SDXL (needed before LCM LoRA selection)
+        self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
+
+        # SDXL's default VAE overflows in fp16 and decodes NaN. Swap to the
+        # community fp16-fix VAE so the full-quality decode path works without
+        # forcing TAESD.
+        if self.sdxl and self.dtype == torch.float16:
+            self._install_sdxl_fp16_vae()
+
+        # Non-turbo models need LCM LoRA to denoise correctly with LCMScheduler
+        # at 1–4 steps. Turbo/Lightning models are already distilled for this.
+        if not self.sd_turbo:
+            self._attach_lcm_lora()
+
+        # Model components (grabbed after LoRA fuse so fused weights are live)
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
         self.vae = self.pipe.vae
         self._full_vae = self.vae  # keep reference for toggling
         self._taesd_vae = None
         self._using_taesd = False
-
-        # Check if SDXL
-        self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
 
         # Setup scheduler
         self.scheduler: LCMScheduler = LCMScheduler.from_config(
@@ -185,6 +198,49 @@ class StreamDiffusionPipeline(Pipeline):
             print(f"Failed to load model {model_id}: {e}")
             raise
 
+    def _install_sdxl_fp16_vae(self) -> None:
+        """Swap SDXL's default VAE for madebyollin/sdxl-vae-fp16-fix.
+
+        Stability AI's SDXL VAE overflows on certain inputs in fp16 and decodes
+        to NaN — even from a perfectly valid UNet prediction. The community
+        fp16-fix VAE is a drop-in replacement with the same architecture and
+        quality, retuned to be numerically stable in fp16.
+        """
+        from diffusers import AutoencoderKL
+
+        try:
+            print("[StreamDiffusion] Installing madebyollin/sdxl-vae-fp16-fix")
+            new_vae = AutoencoderKL.from_pretrained(
+                "madebyollin/sdxl-vae-fp16-fix", torch_dtype=self.dtype
+            ).to(self.device)
+            self.pipe.vae = new_vae
+            print("[StreamDiffusion] SDXL fp16-fix VAE installed")
+        except Exception as e:
+            print(f"[StreamDiffusion] Failed to install fp16-fix VAE: {e}")
+
+    def _attach_lcm_lora(self) -> None:
+        """Load and fuse the appropriate LCM LoRA for a non-turbo SD/SDXL base.
+
+        LCMScheduler at 1–4 steps only produces usable output on models that
+        have been distilled for low-step inference — Turbo, Lightning, or LCM.
+        For plain SD 1.5 / SDXL bases, we attach the matching LCM LoRA so the
+        scheduler path works the same as it does for Turbo.
+        """
+        lcm_lora_id = (
+            "latent-consistency/lcm-lora-sdxl"
+            if self.sdxl
+            else "latent-consistency/lcm-lora-sdv1-5"
+        )
+        print(f"[StreamDiffusion] Loading LCM LoRA: {lcm_lora_id}")
+        try:
+            self.pipe.load_lora_weights(lcm_lora_id, adapter_name="lcm")
+            self.pipe.fuse_lora(lora_scale=1.0, adapter_names=["lcm"])
+            self.pipe.unload_lora_weights()
+            print("[StreamDiffusion] LCM LoRA fused")
+        except Exception as e:
+            print(f"[StreamDiffusion] Failed to load LCM LoRA {lcm_lora_id}: {e}")
+            raise
+
     def _set_taesd(self, enabled: bool) -> None:
         """Switch between TAESD (fast) and full VAE decoder."""
         if enabled == self._using_taesd:
@@ -273,6 +329,14 @@ class StreamDiffusionPipeline(Pipeline):
         if dims_changed:
             self.latent_height = int(height // self.pipe.vae_scale_factor)
             self.latent_width = int(width // self.pipe.vae_scale_factor)
+
+        # --- Scheduler defaults ---
+        # `num_inference_steps` is the user-facing sharpness lever: more steps =
+        # sharper detail (SD-Turbo proper is the exception — it's distilled for
+        # 1 step). When the caller didn't pin a `t_index_list`, walk every step
+        # in the schedule so the UNet sees the full LCM timestep range.
+        if t_index_list is None:
+            t_index_list = list(range(num_inference_steps))
 
         # --- Cheap scalar assignments ---
         self.strength = strength
@@ -723,16 +787,15 @@ class StreamDiffusionPipeline(Pipeline):
         # Calculate alpha/beta values
         alpha_prod_t_sqrt_list = []
         beta_prod_t_sqrt_list = []
+        ac = self.scheduler.alphas_cumprod
+        last_idx = len(ac) - 1
         for timestep in self.sub_timesteps:
-            if timestep >= len(self.scheduler.alphas_cumprod):
-                print(
-                    f"Warning: timestep {timestep} is greater than the number of timesteps {len(self.scheduler.alphas_cumprod)}"
-                )
-                continue
-            alpha_prod_t_sqrt = self.scheduler.alphas_cumprod[timestep].sqrt()
-            beta_prod_t_sqrt = (1 - self.scheduler.alphas_cumprod[timestep]).sqrt()
-            alpha_prod_t_sqrt_list.append(alpha_prod_t_sqrt)
-            beta_prod_t_sqrt_list.append(beta_prod_t_sqrt)
+            # Clamp into range instead of skipping — skipping would make the
+            # downstream .view(len(t_list), 1, 1, 1) reshape fail when any
+            # timestep happened to land out of range for this scheduler.
+            idx = min(int(timestep), last_idx)
+            alpha_prod_t_sqrt_list.append(ac[idx].sqrt())
+            beta_prod_t_sqrt_list.append((1 - ac[idx]).sqrt())
 
         alpha_prod_t_sqrt = (
             torch.stack(alpha_prod_t_sqrt_list)
@@ -945,10 +1008,14 @@ class StreamDiffusionPipeline(Pipeline):
                     (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
                 )
             if self.sdxl:
-                added_cond_kwargs = {
-                    "text_embeds": self.add_text_embeds.to(self.device),
-                    "time_ids": self.add_time_ids.to(self.device),
-                }
+                batch = x_t_latent.shape[0]
+                te = self.add_text_embeds.to(self.device)
+                ti = self.add_time_ids.to(self.device)
+                if te.shape[0] != batch:
+                    te = te[:1].expand(batch, -1)
+                if ti.shape[0] != batch:
+                    ti = ti[:1].expand(batch, -1)
+                added_cond_kwargs = {"text_embeds": te, "time_ids": ti}
 
             x_t_latent = x_t_latent.to(self.device)
             t_list = t_list.to(self.device)
@@ -1086,9 +1153,13 @@ class StreamDiffusionPipeline(Pipeline):
         prompt_interpolation_method = get_param("prompt_interpolation_method", "linear")
         guidance_scale = get_param("guidance_scale", 0.0)
 
-        # SD Turbo: Use single timestep (t_index_list=[0]) but set schedule length
-        # This matches your working project setup
-        num_inference_steps = get_param("num_inference_steps", 3)
+        num_inference_steps = get_param("num_inference_steps", 4)
+        use_suggested_steps = get_param("use_suggested_num_inference_steps", True)
+        if use_suggested_steps:
+            # Per-family suggestion: SD-Turbo proper is 1-step distilled; every
+            # other family (SDXL-Turbo, SDXL-Turbo fine-tunes, SD1.5/SDXL +
+            # LCM LoRA) needs 4 steps to converge to sharp output.
+            num_inference_steps = 1 if (self.sd_turbo and not self.sdxl) else 4
 
         # For img2img with SD Turbo, need higher strength for visible changes
         # 0.5-0.7 = moderate, 0.8-0.95 = heavy transformation
@@ -1170,10 +1241,12 @@ class StreamDiffusionPipeline(Pipeline):
 
         frame = None
 
-        # Process input
-        if image_loopback or (
-            (video is None or len(video) == 0) and self.prev_image_result is not None
-        ):
+        # Process input. Note: image_loopback must be opt-in. Falling back to
+        # `prev_image_result` whenever video is missing turns text mode into a
+        # recursive feedback loop (each frame uses the previous frame's
+        # output as input), which drifts to over-saturated/abstract patterns
+        # within a few frames.
+        if image_loopback and self.prev_image_result is not None:
             frame = self.prev_image_result
         elif video is not None and len(video) > 0:
             # Convert Scope tensor format to pipeline format
@@ -1222,12 +1295,12 @@ class StreamDiffusionPipeline(Pipeline):
             input_latent = self._encode_image(input_tensor)
 
         else:
-            # Text-to-image mode
-            input_latent = torch.randn(
-                (1, 4, self.latent_height, self.latent_width),
-                device=self.device,
-                dtype=self.dtype,
-            )
+            # Text-to-image mode — use the seeded `init_noise` instead of a
+            # fresh unseeded randn. With a fresh randn per call, every frame
+            # would generate a different scene; the seeded buffer keeps the
+            # output stable across frames for the same seed (and lets the
+            # user reseed deterministically by changing `seed`).
+            input_latent = self.init_noise[0:1].clone()
 
         # Run diffusion
         x_0_pred_out = self._predict_x0_batch(input_latent)
