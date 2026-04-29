@@ -1029,17 +1029,14 @@ class StreamDiffusionPipeline(Pipeline):
         # Bypass: pass input through unchanged when disabled
         enabled = kwargs.get("enabled", True)
         if not enabled:
-            if video is not None and len(video) > 0:
-                frame = video[0]
-                while frame.ndim > 3:
-                    frame = frame.squeeze(0)
-                if frame.dtype == torch.uint8:
-                    frame = frame.float() / 255.0
-                return {"video": frame.unsqueeze(0)}
-            # Text mode with no input — return black frame
-            h = kwargs.get("height", self.height)
-            w = kwargs.get("width", self.width)
-            return {"video": torch.zeros(1, h, w, 3, device=self.device)}
+            if video is None or len(video) == 0:
+                return {"video": None}
+            frame = video[0]
+            while frame.ndim > 3:
+                frame = frame.squeeze(0)
+            if frame.dtype == torch.uint8:
+                frame = frame.float() / 255.0
+            return {"video": frame.unsqueeze(0)}
 
         # Detect video↔text mode transitions and self-trigger a reset so stale
         # ControlNet hidden states, EMA bounds, and prev_image_result don't bleed
@@ -1237,6 +1234,34 @@ class StreamDiffusionPipeline(Pipeline):
         x_output = (x_output / 2 + 0.5).clamp(0, 1)
         # Convert back to Scope format: (B, C, H, W) -> (T, H, W, C)
         output = x_output.permute(0, 2, 3, 1)
+
+        # ── Mask compositing ──────────────────────────────────────────
+        # Drop-in compatible with vace_input_masks from yolo_mask / scope-sam3
+        # (shape (1, 1, F, H, W), binary). Skip in pure text mode where
+        # there's no original frame to blend with.
+        mask_compositing = kwargs.get("mask_compositing", "none")
+        mask_strength = float(kwargs.get("mask_strength", 1.0))
+        masks_in = kwargs.get("vace_input_masks")
+        if (
+            mask_compositing != "none"
+            and mask_strength > 0
+            and masks_in is not None
+            and frame is not None
+        ):
+            m = masks_in[:, :, 0].to(device=output.device, dtype=output.dtype)
+            if m.shape[-2:] != (height, width):
+                m = torch.nn.functional.interpolate(
+                    m, size=(height, width), mode="bilinear", align_corners=False
+                )
+            mask_feather = float(kwargs.get("mask_feather", 0.0))
+            if mask_feather > 0:
+                k = max(1, int(mask_feather) * 2 + 1)
+                m = torch.nn.functional.avg_pool2d(m, k, stride=1, padding=k // 2)
+            if mask_compositing == "keep_sd_outside":
+                m = 1.0 - m
+            m = (m * mask_strength).clamp(0, 1).permute(0, 2, 3, 1)  # (1,H,W,1)
+            orig = frame.unsqueeze(0).to(device=output.device, dtype=output.dtype)
+            output = m * output + (1.0 - m) * orig
 
         # Cache result
         self.prev_image_result = output

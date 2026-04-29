@@ -32,6 +32,11 @@ class StreamDiffusionConfig(BasePipelineConfig):
 
     supports_lora = True
 
+    # Accept a mask stream from upstream segmenters (YOLO mask, SAM3 mask, etc.)
+    # in addition to video. Mask is (1, 1, F, H, W) binary; compositing happens
+    # post-SD per the mask_compositing field below.
+    inputs = ["video", "vace_input_masks"]
+
     # ========================================
     # Pipeline Control
     # ========================================
@@ -242,6 +247,42 @@ class StreamDiffusionConfig(BasePipelineConfig):
         default=False,
         description="Use last frame as input for the next generation",
         json_schema_extra=ui_field_config(order=49, label="Image Loopback"),
+    )
+
+    # ========================================
+    # Mask Compositing (consumes vace_input_masks from upstream segmenter)
+    # ========================================
+
+    mask_compositing: Literal["none", "keep_sd_inside", "keep_sd_outside"] = Field(
+        default="none",
+        description=(
+            "Post-SD mask blending. 'none' ignores incoming masks. "
+            "'keep_sd_inside': SD output inside the mask, original frame outside (classic inpaint look). "
+            "'keep_sd_outside': SD output outside the mask, original preserved inside (protect the subject)."
+        ),
+        json_schema_extra=ui_field_config(order=55, label="Mask Compositing"),
+    )
+
+    mask_feather: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=32.0,
+        description=(
+            "Soft mask edges (pixels). 0 = hard edge. Cheap box-blur applied "
+            "to the mask before compositing."
+        ),
+        json_schema_extra=ui_field_config(order=56, label="Mask Feather"),
+    )
+
+    mask_strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Overall mask blend strength. 0 disables compositing, 1 is full effect. "
+            "Use intermediate values to ghost the original through the SD output."
+        ),
+        json_schema_extra=ui_field_config(order=57, label="Mask Strength"),
     )
 
     # Resolution settings (can be overridden at runtime)
