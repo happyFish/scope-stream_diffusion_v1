@@ -1237,13 +1237,14 @@ class StreamDiffusionPipeline(Pipeline):
 
         # ── Mask compositing ──────────────────────────────────────────
         # Drop-in compatible with vace_input_masks from yolo_mask / scope-sam3
-        # (shape (1, 1, F, H, W), binary). Skip in pure text mode where
-        # there's no original frame to blend with.
-        mask_compositing = kwargs.get("mask_compositing", "none")
+        # (shape (1, 1, F, H, W), binary). SD output where mask=1, original
+        # where mask=0; flip via the upstream segmenter's Invert Mask. Skip
+        # in pure text mode where there's no original frame to blend with.
+        mask_compositing = bool(kwargs.get("mask_compositing", False))
         mask_strength = float(kwargs.get("mask_strength", 1.0))
         masks_in = kwargs.get("vace_input_masks")
         if (
-            mask_compositing != "none"
+            mask_compositing
             and mask_strength > 0
             and masks_in is not None
             and frame is not None
@@ -1257,8 +1258,6 @@ class StreamDiffusionPipeline(Pipeline):
             if mask_feather > 0:
                 k = max(1, int(mask_feather) * 2 + 1)
                 m = torch.nn.functional.avg_pool2d(m, k, stride=1, padding=k // 2)
-            if mask_compositing == "keep_sd_outside":
-                m = 1.0 - m
             m = (m * mask_strength).clamp(0, 1).permute(0, 2, 3, 1)  # (1,H,W,1)
             orig = frame.unsqueeze(0).to(device=output.device, dtype=output.dtype)
             output = m * output + (1.0 - m) * orig

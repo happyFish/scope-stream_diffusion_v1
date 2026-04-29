@@ -253,12 +253,12 @@ class StreamDiffusionConfig(BasePipelineConfig):
     # Mask Compositing (consumes vace_input_masks from upstream segmenter)
     # ========================================
 
-    mask_compositing: Literal["none", "keep_sd_inside", "keep_sd_outside"] = Field(
-        default="none",
+    mask_compositing: bool = Field(
+        default=False,
         description=(
-            "Post-SD mask blending. 'none' ignores incoming masks. "
-            "'keep_sd_inside': SD output inside the mask, original frame outside (classic inpaint look). "
-            "'keep_sd_outside': SD output outside the mask, original preserved inside (protect the subject)."
+            "Composite SD output with the original frame using the incoming "
+            "mask. SD output goes where mask=1, original goes where mask=0. "
+            "Flip directions by toggling the upstream segmenter's Invert Mask."
         ),
         json_schema_extra=ui_field_config(order=55, label="Mask Compositing"),
     )
