@@ -85,16 +85,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
     )
 
-    compile_unet: bool = Field(
-        default=False,
-        description=(
-            "torch.compile the UNet (and ControlNet, if active) for ~30–50% "
-            "speedup on the denoising step. First run after enabling stalls "
-            "15–30s while compiling. Stays compiled until the pipeline reloads."
-        ),
-        json_schema_extra=ui_field_config(order=2, label="Compile UNet"),
-    )
-
     controlnet_mode: Literal["none", "depth", "scribble"] = Field(
         default="none",
         description="ControlNet conditioning mode. 'depth' runs Video Depth Anything internally and routes the depth map to ControlNet. First switch to a new mode stalls while the model loads.",

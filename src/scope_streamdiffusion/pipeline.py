@@ -92,11 +92,10 @@ class StreamDiffusionPipeline(Pipeline):
         self._taesd_vae = None
         self._using_taesd = False
 
-        # torch.compile state — set once when `compile_unet` is first observed True.
-        # We compile the bound forward methods (not the modules themselves) so
-        # diffusers' Module.__call__ path stays clean and we can swap controlnets.
+        # legacy torch.compile flag — kept so other code paths that read
+        # `_unet_compiled` (e.g. _ensure_trt_unet's "restore eager" branch)
+        # continue to work. compile_unet schema field is gone in Phase 5.
         self._unet_compiled: bool = False
-        self._compiled_controlnet_ids: set[int] = set()
 
         # TAESD TRT state
         self._trt_taesd_built: bool = False
@@ -1349,7 +1348,6 @@ class StreamDiffusionPipeline(Pipeline):
         # at ~40 ms/call vs TAESD's ~5 ms. Big perf cliff if the param isn't
         # propagated from moth (e.g. queue-drop or absent from project file).
         use_taesd = get_param("use_taesd", True)
-        compile_unet = get_param("compile_unet", False)
         # acceleration_mode is locked at init (see __init__) — runtime updates
         # don't change it because TRT engines can't be hot-swapped.
         acceleration_mode = self._acceleration_mode
@@ -1420,39 +1418,6 @@ class StreamDiffusionPipeline(Pipeline):
                     print(f"[TRT] TAESD engine swap failed, using eager: {e}")
                     import traceback
                     traceback.print_exc()
-
-        # torch.compile UNet (and current ControlNet) on first observed True.
-        # Compile the bound forward methods so diffusers' Module.__call__ path
-        # is unchanged and module hooks/repr still work.
-        # Skip when TRT engines are active — dynamo wrapper interferes with
-        # ONNX tracing AND we don't need eager compile when the engine runs.
-        if compile_unet and acceleration_mode != "trt":
-            if not self._unet_compiled:
-                try:
-                    self.unet.forward = torch.compile(  # type: ignore[method-assign]
-                        self.unet.forward,
-                        mode="reduce-overhead",
-                        dynamic=True,
-                        fullgraph=False,
-                    )
-                    self._unet_compiled = True
-                    print("[StreamDiffusion] torch.compile enabled on UNet (first call will be slow)")
-                except Exception as e:
-                    print(f"[StreamDiffusion] UNet compile failed, using eager: {e}")
-                    self._unet_compiled = True  # don't retry every frame
-            if self.controlnet is not None and id(self.controlnet) not in self._compiled_controlnet_ids:
-                try:
-                    self.controlnet.forward = torch.compile(  # type: ignore[method-assign]
-                        self.controlnet.forward,
-                        mode="reduce-overhead",
-                        dynamic=True,
-                        fullgraph=False,
-                    )
-                    self._compiled_controlnet_ids.add(id(self.controlnet))
-                    print(f"[StreamDiffusion] torch.compile enabled on ControlNet ({controlnet_mode})")
-                except Exception as e:
-                    print(f"[StreamDiffusion] ControlNet compile failed, using eager: {e}")
-                    self._compiled_controlnet_ids.add(id(self.controlnet))  # don't retry
 
         self.controlnet_conditioning_scale = self._cn.scale
         # Extract transition (explicit transition overrides auto-transition)

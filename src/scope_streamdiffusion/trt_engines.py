@@ -54,67 +54,6 @@ def _model_cache_dir(model_id: str, suffix: str = "") -> Path:
     return d
 
 
-def build_unet_with_controlnet_engine(
-    unet: UNet2DConditionModel,
-    controlnet,
-    *,
-    model_id: str,
-    controlnet_id: str,
-    image_height: int = 512,
-    image_width: int = 512,
-    min_batch_size: int = 1,
-    max_batch_size: int = 4,
-) -> Path:
-    """Build (or reuse) a single TRT engine combining UNet + ControlNet.
-
-    Engine accepts dynamic spatial dims 256-1024 and batch min..max. The
-    controlnet conditioning image and scale are runtime inputs — one engine
-    serves any conditioning_scale without rebuild.
-
-    Engine cache key includes both model_id and controlnet_id so e.g. depth
-    vs scribble ControlNets get separate engines.
-    """
-    from ._trt import (
-        UNetWithControlNet,
-        compile_unet_with_controlnet,
-        create_onnx_path,
-    )
-
-    suffix = f"unetcn_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
-    cache_dir = _model_cache_dir(f"{model_id}::{controlnet_id}", suffix)
-    onnx_dir = cache_dir / "onnx"
-    onnx_dir.mkdir(parents=True, exist_ok=True)
-    engine_path = cache_dir / "unet_cn.engine"
-
-    if engine_path.exists():
-        logger.info(f"[TRT] Reusing cached UNet+CN engine: {engine_path}")
-        return engine_path
-
-    logger.info(f"[TRT] Building UNet+CN engine -> {engine_path} (5-10 min on first build)")
-
-    model_data = UNetWithControlNet(
-        fp16=True,
-        device=str(unet.device) if unet.device.type != "meta" else "cuda",
-        max_batch_size=max_batch_size,
-        min_batch_size=min_batch_size,
-        embedding_dim=unet.config.cross_attention_dim,
-        unet_dim=unet.config.in_channels,
-    )
-    compile_unet_with_controlnet(
-        unet, controlnet, model_data,
-        str(create_onnx_path("unet_cn", str(onnx_dir), opt=False)),
-        str(create_onnx_path("unet_cn", str(onnx_dir), opt=True)),
-        str(engine_path),
-        opt_batch_size=min_batch_size,
-        engine_build_options={
-            "build_dynamic_shape": True,
-            "build_static_batch": False,
-        },
-    )
-    logger.info(f"[TRT] UNet+CN engine built: {engine_path}")
-    return engine_path
-
-
 def build_controlnet_engine(
     controlnet,
     *,
@@ -488,69 +427,6 @@ class TRTUNetAdapter:
         return (out.sample,)
 
     # diffusers Module surface — pipeline.py never calls these in practice
-    def to(self, *args, **kwargs):
-        return self
-
-    def eval(self):
-        return self
-
-
-class TRTUNetControlNetAdapter:
-    """Drop-in for diffusers UNet that internally folds in ControlNet.
-
-    The pipeline.py `_unet_step` does:
-        cn(...) -> residuals
-        unet(..., down_block_additional_residuals=residuals)
-
-    To use this adapter, _unet_step needs to instead:
-        unet_cn(latents, t, embeds, controlnet_image=cond, controlnet_scale=scale)
-
-    This adapter exposes that signature. We expose:
-      __call__(sample, timestep, encoder_hidden_states, controlnet_image,
-               controlnet_scale, return_dict, **kwargs)
-    """
-
-    def __init__(self, engine_path: Path, cuda_stream, *, use_cuda_graph: bool = False):
-        from ._trt import UNetWithControlNetEngine
-        self.engine = UNetWithControlNetEngine(
-            str(engine_path), cuda_stream, use_cuda_graph=use_cuda_graph,
-        )
-        self.config = _ConfigShim()
-        self.add_embedding = None
-
-    def __call__(
-        self,
-        sample: torch.Tensor,
-        timestep,
-        encoder_hidden_states: torch.Tensor,
-        controlnet_image: torch.Tensor,
-        controlnet_scale,
-        return_dict: bool = True,
-        **kwargs,
-    ):
-        if not isinstance(timestep, torch.Tensor):
-            timestep = torch.tensor(timestep, device=sample.device)
-        if timestep.ndim == 0:
-            timestep = timestep.unsqueeze(0)
-
-        if not isinstance(controlnet_scale, torch.Tensor):
-            controlnet_scale = torch.tensor(
-                [float(controlnet_scale)], dtype=torch.float32, device=sample.device,
-            )
-        elif controlnet_scale.ndim == 0:
-            controlnet_scale = controlnet_scale.unsqueeze(0).to(torch.float32)
-
-        out = self.engine(
-            latent_model_input=sample,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            controlnet_image=controlnet_image,
-            controlnet_scale=controlnet_scale,
-        )
-        if return_dict:
-            return out
-        return (out.sample,)
-
     def to(self, *args, **kwargs):
         return self
 
