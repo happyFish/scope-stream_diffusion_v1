@@ -62,11 +62,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
         description="Model ID from HuggingFace or local path to model",
     )
 
-    acceleration: Literal["none", "xformers", "tensorrt"] = Field(
-        default="xformers",
-        description="Hardware acceleration method",
-    )
-
     acceleration_mode: Literal["none", "trt"] = Field(
         default="trt",
         description=(
