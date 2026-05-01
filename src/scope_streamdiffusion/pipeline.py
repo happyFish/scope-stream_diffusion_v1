@@ -1343,7 +1343,6 @@ class StreamDiffusionPipeline(Pipeline):
         depth_skip_interval = get_param("depth_skip_interval", 3)
         depth_input_size = get_param("depth_input_size", 518)
         depth_temporal_cache = get_param("depth_temporal_cache", True)
-        depth_compile = get_param("depth_compile", False)
         # Default True matches schema. With False the full SD VAE decode runs
         # at ~40 ms/call vs TAESD's ~5 ms. Big perf cliff if the param isn't
         # propagated from moth (e.g. queue-drop or absent from project file).
@@ -1386,7 +1385,6 @@ class StreamDiffusionPipeline(Pipeline):
             depth_skip_interval=depth_skip_interval,
             depth_input_size=depth_input_size,
             depth_temporal_cache=depth_temporal_cache,
-            depth_compile=depth_compile,
         )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input

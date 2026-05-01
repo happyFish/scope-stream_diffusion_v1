@@ -130,12 +130,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=9, label="Depth Temporal Cache"),
     )
 
-    depth_compile: bool = Field(
-        default=False,
-        description="torch.compile the depth model on first use. First call after enabling stalls 10–30s while compiling; subsequent calls are 15–30% faster. Stays compiled until the pipeline reloads.",
-        json_schema_extra=ui_field_config(order=10, label="Depth torch.compile"),
-    )
-
     controlnet_temporal_smoothing: float = Field(
         default=1.0,
         ge=0.0,
