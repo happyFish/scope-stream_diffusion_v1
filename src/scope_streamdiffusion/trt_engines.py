@@ -130,7 +130,7 @@ class TRTUNetAdapter:
     (UNet2DConditionOutput).
     """
 
-    def __init__(self, engine_path: Path, cuda_stream, *, use_cuda_graph: bool = True):
+    def __init__(self, engine_path: Path, cuda_stream, *, use_cuda_graph: bool = False):
         from ._trt import UNet2DConditionModelEngine
         # use_cuda_graph: capture the engine's kernel sequence on first call
         # and replay on subsequent calls. Eliminates ~3-5ms of TRT launch
