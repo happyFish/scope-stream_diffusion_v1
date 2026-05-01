@@ -256,33 +256,38 @@ class StreamDiffusionPipeline(Pipeline):
     def _ensure_trt_unet(self, controlnet_mode: str = "none") -> None:
         """Build TRT engine for the UNet and swap self.unet to the adapter.
 
-        Always builds the plain UNet engine (no ControlNet inputs). When
-        controlnet_mode != 'none', the eager ControlNet still runs every
-        step — there's no combined UNet+ControlNet engine yet.
+        Two variants depending on controlnet_mode:
+          * 'none'              → plain UNet engine (3 inputs, fastest)
+          * 'depth' | 'scribble' → UNet engine WITH ControlNet residual input
+            slots so the ControlNet output (from the standalone engine)
+            actually reaches the UNet's inner blocks. Without this, the
+            residuals get silently dropped and ControlNet conditioning has
+            no effect on the output.
 
-        Why no combined engine: the obvious approach (UNet2DConditionSingleControlNetModel
-        wrapper + single TRT engine) works through ONNX export but TRT 10.16
-        rejects the resulting graph at engine-build time with
-        ``Cask convolution isConsistent check failed`` — a known issue with
-        large diffusion-model graphs that have been merged. The fix is the
-        two-engine approach (separate TRT UNet with control input slots +
-        separate TRT ControlNet engine) per the StreamDiffusion lib's
-        models.py:UNet.use_control pattern. Substantial work; deferred.
-
-        One-shot per process. Engine cached on disk; subsequent runs skip
-        the multi-minute build.
+        Engines are cached separately on disk because they have different
+        signatures. Switching modes mid-process may trigger a rebuild.
         """
-        if self._trt_unet_built:
+        want_control = controlnet_mode in ("depth", "scribble")
+
+        # If we previously built the wrong variant, rebuild now.
+        if self._trt_unet_built and self._trt_unet_has_controlnet == want_control:
             return
-        self._trt_unet_built = True  # prevent retry storm on failure
+        if self._trt_unet_built and self._trt_unet_has_controlnet != want_control:
+            print(
+                f"[TRT] UNet ctrl-input variant changed "
+                f"(had={self._trt_unet_has_controlnet}, want={want_control}); rebuilding"
+            )
+
+        # Set sticky flags before the build so failures don't retry every frame.
+        self._trt_unet_built = True
+        self._trt_unet_has_controlnet = want_control
 
         # Restore eager forward if torch.compile wrapped it earlier.
         if self._unet_compiled:
             self.unet = self.pipe.unet
             self._unet_compiled = False
 
-        # xformers flash-attention ops can't be ONNX-exported. Swap to default
-        # attention processors before tracing.
+        # xformers flash-attention ops can't be ONNX-exported.
         try:
             self.pipe.unet.set_default_attn_processor()
             print("[TRT] swapped UNet to default attention for ONNX export")
@@ -293,27 +298,52 @@ class StreamDiffusionPipeline(Pipeline):
             except Exception as e:
                 print(f"[TRT] could not disable xformers attention: {e}")
 
-        from .trt_engines import TRTUNetAdapter, build_unet_engine, make_cuda_stream
+        from .trt_engines import (
+            TRTUNetAdapter,
+            TRTUNetWithControlAdapter,
+            build_unet_engine,
+            build_unet_with_control_engine,
+            make_cuda_stream,
+        )
 
         if self._trt_cuda_stream is None:
             self._trt_cuda_stream = make_cuda_stream()
 
-        print(
-            "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after",
-            flush=True,
-        )
-        engine_path = build_unet_engine(
-            self.pipe.unet,
-            model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
-            image_height=int(self.height),
-            image_width=int(self.width),
-            min_batch_size=1,
-            max_batch_size=4,
-        )
-        self._trt_eager_unet = self.pipe.unet
-        self.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
-        self._trt_unet_has_controlnet = False
-        print(f"[TRT] UNet engine active: {engine_path}", flush=True)
+        if want_control:
+            print(
+                "[TRT] Preparing UNet+ctrl engine — first build takes 5-10 min, cached after",
+                flush=True,
+            )
+            engine_path = build_unet_with_control_engine(
+                self.pipe.unet,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+                num_down_residuals=12,
+            )
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = TRTUNetWithControlAdapter(
+                engine_path, self._trt_cuda_stream, num_down_residuals=12,
+            )
+            print(f"[TRT] UNet+ctrl engine active: {engine_path}", flush=True)
+        else:
+            print(
+                "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after",
+                flush=True,
+            )
+            engine_path = build_unet_engine(
+                self.pipe.unet,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
+            print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model."""
@@ -1020,50 +1050,32 @@ class StreamDiffusionPipeline(Pipeline):
         else:
             x_t_latent_plus_uc = x_t_latent
 
-        # When the TRT combined UNet+CN engine is active, the engine handles
-        # the ControlNet pass internally — we pass the conditioning image and
-        # scale as runtime inputs and skip the separate self.controlnet(...)
-        # call. Saves one full UNet-shaped forward per denoising step.
-        if (
-            getattr(self, "_trt_unet_has_controlnet", False)
-            and self.controlnet_input is not None
-        ):
+        # Compute ControlNet residuals if conditioning is available.
+        # This works for all paths — eager ControlNet, TRT ControlNet — they
+        # all expose the diffusers ControlNetModel signature.
+        down_block_res_samples = None
+        mid_block_res_sample = None
+        if self.controlnet is not None and self.controlnet_input is not None:
             batch_size = x_t_latent_plus_uc.shape[0]
             cond_image = self.controlnet_input.expand(batch_size, -1, -1, -1)
-            model_pred = self.unet(
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
                 x_t_latent_plus_uc,
                 t_list,
                 encoder_hidden_states=self.prompt_embeds,
-                controlnet_image=cond_image,
-                controlnet_scale=self.controlnet_conditioning_scale,
+                controlnet_cond=cond_image,
+                conditioning_scale=self.controlnet_conditioning_scale,
                 return_dict=False,
-            )[0]
-        else:
-            # Eager (or TRT-without-controlnet): compute residuals separately,
-            # pass into UNet via the diffusers down_block_additional_residuals API.
-            down_block_res_samples = None
-            mid_block_res_sample = None
-            if self.controlnet is not None and self.controlnet_input is not None:
-                batch_size = x_t_latent_plus_uc.shape[0]
-                cond_image = self.controlnet_input.expand(batch_size, -1, -1, -1)
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    x_t_latent_plus_uc,
-                    t_list,
-                    encoder_hidden_states=self.prompt_embeds,
-                    controlnet_cond=cond_image,
-                    conditioning_scale=self.controlnet_conditioning_scale,
-                    return_dict=False,
-                )
+            )
 
-            model_pred = self.unet(
-                x_t_latent_plus_uc,
-                t_list,
-                encoder_hidden_states=self.prompt_embeds,
-                added_cond_kwargs=added_cond_kwargs,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample,
-                return_dict=False,
-            )[0]
+        model_pred = self.unet(
+            x_t_latent_plus_uc,
+            t_list,
+            encoder_hidden_states=self.prompt_embeds,
+            added_cond_kwargs=added_cond_kwargs,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
+            return_dict=False,
+        )[0]
 
         # Compute denoised sample
         if self.use_denoising_batch:

@@ -247,6 +247,129 @@ class TRTControlNetAdapter:
         return self
 
 
+def build_unet_with_control_engine(
+    unet: UNet2DConditionModel,
+    *,
+    model_id: str,
+    image_height: int = 512,
+    image_width: int = 512,
+    min_batch_size: int = 1,
+    max_batch_size: int = 4,
+    num_down_residuals: int = 12,
+) -> Path:
+    """Build (or reuse) a TRT UNet engine that accepts ControlNet residuals
+    as runtime inputs. Pair with `build_controlnet_engine` to get
+    end-to-end TRT acceleration for the depth/scribble path.
+    """
+    from ._trt import (
+        UNetWithControlInputs,
+        compile_unet_with_control,
+        create_onnx_path,
+    )
+
+    suffix = f"unet_ctrl_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
+    cache_dir = _model_cache_dir(model_id, suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "unet_ctrl.engine"
+
+    if engine_path.exists():
+        logger.info(f"[TRT] Reusing cached UNet+ctrl engine: {engine_path}")
+        return engine_path
+
+    logger.info(f"[TRT] Building UNet+ctrl engine -> {engine_path} (5-10 min)")
+
+    block_out_channels = tuple(unet.config.block_out_channels)
+    model_data = UNetWithControlInputs(
+        fp16=True,
+        device=str(unet.device) if unet.device.type != "meta" else "cuda",
+        max_batch_size=max_batch_size,
+        min_batch_size=min_batch_size,
+        embedding_dim=unet.config.cross_attention_dim,
+        unet_dim=unet.config.in_channels,
+        num_down_residuals=num_down_residuals,
+        block_out_channels=block_out_channels,
+    )
+    compile_unet_with_control(
+        unet, model_data,
+        str(create_onnx_path("unet_ctrl", str(onnx_dir), opt=False)),
+        str(create_onnx_path("unet_ctrl", str(onnx_dir), opt=True)),
+        str(engine_path),
+        opt_batch_size=min_batch_size,
+        engine_build_options={
+            "build_dynamic_shape": True,
+            "build_static_batch": False,
+        },
+    )
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    logger.info(f"[TRT] UNet+ctrl engine built: {engine_path}")
+    return engine_path
+
+
+class TRTUNetWithControlAdapter:
+    """Drop-in for diffusers UNet that forwards ControlNet residuals to engine.
+
+    pipeline._unet_step calls:
+        self.unet(sample, t, encoder_hidden_states=...,
+                  down_block_additional_residuals=[...],
+                  mid_block_additional_residual=mid,
+                  return_dict=False)[0]
+
+    This adapter unpacks the residuals into the engine's named slots.
+    """
+
+    def __init__(self, engine_path: Path, cuda_stream, *, num_down_residuals: int = 12, use_cuda_graph: bool = False):
+        from ._trt import UNet2DConditionModelWithControlEngine
+        self.engine = UNet2DConditionModelWithControlEngine(
+            str(engine_path), cuda_stream,
+            num_down_residuals=num_down_residuals,
+            use_cuda_graph=use_cuda_graph,
+        )
+        self.num_down_residuals = num_down_residuals
+        self.config = _ConfigShim()
+        self.add_embedding = None
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+
+        if down_block_additional_residuals is None or mid_block_additional_residual is None:
+            raise RuntimeError(
+                "TRTUNetWithControlAdapter requires ControlNet residuals — "
+                "down_block_additional_residuals / mid_block_additional_residual."
+            )
+
+        out = self.engine(
+            latent_model_input=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_residuals=list(down_block_additional_residuals),
+            mid_block_residual=mid_block_additional_residual,
+        )
+        if return_dict:
+            return out
+        return (out.sample,)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+
 def build_unet_engine(
     unet: UNet2DConditionModel,
     *,

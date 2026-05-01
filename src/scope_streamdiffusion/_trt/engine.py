@@ -56,6 +56,74 @@ class UNet2DConditionModelEngine:
         pass
 
 
+class UNet2DConditionModelWithControlEngine:
+    """UNet engine variant that accepts ControlNet residuals as runtime inputs.
+
+    Inputs match `UNetWithControlInputs.get_input_names()` —
+      sample, timestep, encoder_hidden_states,
+      input_control_00..N-1, input_control_middle.
+    Output: latent (same as plain UNet).
+
+    Caller is responsible for producing the residuals (e.g. via the
+    standalone TRT ControlNet engine) and passing them in.
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        stream: cuda.Stream,
+        num_down_residuals: int,
+        use_cuda_graph: bool = False,
+    ):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.use_cuda_graph = use_cuda_graph
+        self.num_down_residuals = num_down_residuals
+        self.engine.load()
+        self.engine.activate()
+
+    def __call__(
+        self,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        down_block_residuals,  # list[Tensor] of length num_down_residuals
+        mid_block_residual: torch.Tensor,
+        **kwargs,
+    ) -> Any:
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+
+        shape_dict = {
+            "sample": latent_model_input.shape,
+            "timestep": timestep.shape,
+            "encoder_hidden_states": encoder_hidden_states.shape,
+            "latent": latent_model_input.shape,
+            "input_control_middle": mid_block_residual.shape,
+        }
+        feed = {
+            "sample": latent_model_input,
+            "timestep": timestep,
+            "encoder_hidden_states": encoder_hidden_states,
+            "input_control_middle": mid_block_residual,
+        }
+        for i in range(self.num_down_residuals):
+            shape_dict[f"input_control_{i:02d}"] = down_block_residuals[i].shape
+            feed[f"input_control_{i:02d}"] = down_block_residuals[i]
+
+        self.engine.allocate_buffers(shape_dict=shape_dict, device=latent_model_input.device)
+        noise_pred = self.engine.infer(
+            feed, self.stream, use_cuda_graph=self.use_cuda_graph,
+        )["latent"]
+        return UNet2DConditionOutput(sample=noise_pred)
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
 class UNetWithControlNetEngine:
     """Runtime wrapper for the combined UNet+ControlNet engine.
 

@@ -526,6 +526,188 @@ class UNet(BaseModel):
         )
 
 
+class UNetExportWrapperWithControl(torch.nn.Module):
+    """Wraps the diffusers UNet so ControlNet residuals are positional inputs.
+
+    Diffusers' UNet2DConditionModel.forward accepts the residuals as kwargs
+    (`down_block_additional_residuals`, `mid_block_additional_residual`),
+    but ONNX export prefers positional. We unwrap a list-of-tensors arg
+    into N positional args matching the engine's input names.
+    """
+
+    def __init__(self, unet, num_down_residuals: int):
+        super().__init__()
+        self.unet = unet
+        self.num_down_residuals = num_down_residuals
+
+    def forward(self, sample, timestep, encoder_hidden_states, *control_inputs):
+        # control_inputs is (down_0, down_1, ..., down_{N-1}, mid)
+        down_residuals = list(control_inputs[: self.num_down_residuals])
+        mid_residual = control_inputs[self.num_down_residuals]
+        out = self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=down_residuals,
+            mid_block_additional_residual=mid_residual,
+            return_dict=False,
+        )
+        return out[0]
+
+
+class UNetWithControlInputs(BaseModel):
+    """TRT I/O spec for the UNet with ControlNet residual inputs.
+
+    Inputs: sample, timestep, encoder_hidden_states + N control inputs
+            (input_control_00..N-1) + input_control_middle.
+    Output: latent.
+
+    Shapes for SD1.5/2.1 with block_out_channels=(320, 640, 1280, 1280):
+      down 0..2:  320ch @ H/8 x W/8         (3 residuals)
+      down 3..5:  320/640/640ch @ H/16 x W/16   (3 residuals, downsample)
+      down 6..8:  640/1280/1280ch @ H/32 x W/32  (3 residuals)
+      down 9..11: 1280ch @ H/64 x W/64           (3 residuals)
+      middle:     1280ch @ H/64 x W/64
+    """
+
+    def __init__(
+        self,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=768,
+        text_maxlen=77,
+        unet_dim=4,
+        num_down_residuals=12,
+        block_out_channels=(320, 640, 1280, 1280),
+    ):
+        super(UNetWithControlInputs, self).__init__(
+            fp16=fp16, device=device,
+            max_batch_size=max_batch_size, min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim, text_maxlen=text_maxlen,
+        )
+        self.unet_dim = unet_dim
+        self.num_down_residuals = num_down_residuals
+        self.block_out_channels = tuple(block_out_channels)
+        self.name = "UNetWithControlInputs"
+
+    def _residual_spec(self):
+        """Returns list of (channels, downsample_factor_from_latent_dims) for each
+        down residual. Mid is always (last_channel, 8)."""
+        chans = self.block_out_channels
+        if len(chans) == 4 and self.num_down_residuals == 12:
+            return [
+                (chans[0], 1), (chans[0], 1), (chans[0], 1),
+                (chans[0], 2), (chans[1], 2), (chans[1], 2),
+                (chans[1], 4), (chans[2], 4), (chans[2], 4),
+                (chans[2], 8), (chans[3], 8), (chans[3], 8),
+            ]
+        return [(chans[0], 1)] * self.num_down_residuals
+
+    def get_input_names(self):
+        return [
+            "sample", "timestep", "encoder_hidden_states",
+        ] + [f"input_control_{i:02d}" for i in range(self.num_down_residuals)] + [
+            "input_control_middle"
+        ]
+
+    def get_output_names(self):
+        return ["latent"]
+
+    def get_dynamic_axes(self):
+        axes = {
+            "sample": {0: "2B", 2: "H", 3: "W"},
+            "timestep": {0: "2B"},
+            "encoder_hidden_states": {0: "2B"},
+            "latent": {0: "2B", 2: "H", 3: "W"},
+            # Each spatial dim is dynamic — has to match the profile, otherwise
+            # TRT validates the static export against the dynamic profile and
+            # rejects the engine ("Dimension mismatch for tensor ...").
+            "input_control_middle": {0: "2B", 2: "Hm", 3: "Wm"},
+        }
+        for i in range(self.num_down_residuals):
+            axes[f"input_control_{i:02d}"] = {0: "2B", 2: f"Hc{i}", 3: f"Wc{i}"}
+        return axes
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        (
+            min_batch, max_batch,
+            min_image_height, max_image_height,
+            min_image_width, max_image_width,
+            min_latent_height, max_latent_height,
+            min_latent_width, max_latent_width,
+        ) = self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+
+        profile = {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+        }
+        spec = self._residual_spec()
+        # control inputs vary spatially with latent dims
+        for i, (c, ds) in enumerate(spec):
+            profile[f"input_control_{i:02d}"] = [
+                (min_batch, c, max(1, min_latent_height // ds), max(1, min_latent_width // ds)),
+                (batch_size, c, max(1, latent_height // ds), max(1, latent_width // ds)),
+                (max_batch, c, max(1, max_latent_height // ds), max(1, max_latent_width // ds)),
+            ]
+        # mid is at /8 from latent space
+        mid_ch = self.block_out_channels[-1]
+        profile["input_control_middle"] = [
+            (min_batch, mid_ch, max(1, min_latent_height // 8), max(1, min_latent_width // 8)),
+            (batch_size, mid_ch, max(1, latent_height // 8), max(1, latent_width // 8)),
+            (max_batch, mid_ch, max(1, max_latent_height // 8), max(1, max_latent_width // 8)),
+        ]
+        return profile
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        d = {
+            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (2 * batch_size,),
+            "encoder_hidden_states": (2 * batch_size, self.text_maxlen, self.embedding_dim),
+            "latent": (2 * batch_size, 4, latent_height, latent_width),
+            "input_control_middle": (
+                2 * batch_size, self.block_out_channels[-1],
+                max(1, latent_height // 8), max(1, latent_width // 8),
+            ),
+        }
+        for i, (c, ds) in enumerate(self._residual_spec()):
+            d[f"input_control_{i:02d}"] = (
+                2 * batch_size, c,
+                max(1, latent_height // ds), max(1, latent_width // ds),
+            )
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        sample = torch.randn(2 * batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device)
+        ts = torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device)
+        ehs = torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device)
+        controls = []
+        for c, ds in self._residual_spec():
+            controls.append(
+                torch.randn(2 * batch_size, c, max(1, latent_height // ds), max(1, latent_width // ds), dtype=dtype, device=self.device)
+            )
+        mid_ch = self.block_out_channels[-1]
+        mid_residual = torch.randn(
+            2 * batch_size, mid_ch, max(1, latent_height // 8), max(1, latent_width // 8),
+            dtype=dtype, device=self.device,
+        )
+        return (sample, ts, ehs, *controls, mid_residual)
+
+
 class UNetWithControlNet(BaseModel):
     """I/O spec for the combined UNet + single-ControlNet TRT engine.
 

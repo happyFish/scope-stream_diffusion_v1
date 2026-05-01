@@ -24,6 +24,7 @@ from .engine import (
     AutoencoderKLEngine,
     ControlNetEngine,
     UNet2DConditionModelEngine,
+    UNet2DConditionModelWithControlEngine,
     UNetWithControlNetEngine,
 )
 from .models import (
@@ -33,6 +34,8 @@ from .models import (
     ControlNetExportWrapper,
     UNet,
     UNet2DConditionSingleControlNetModel,
+    UNetExportWrapperWithControl,
+    UNetWithControlInputs,
     UNetWithControlNet,
     VAEEncoder,
 )
@@ -109,7 +112,10 @@ __all__ = [
     "TorchVAEEncoder",
     "UNet",
     "UNet2DConditionModelEngine",
+    "UNet2DConditionModelWithControlEngine",
     "UNet2DConditionSingleControlNetModel",
+    "UNetExportWrapperWithControl",
+    "UNetWithControlInputs",
     "UNetWithControlNet",
     "UNetWithControlNetEngine",
     "VAE",
@@ -117,6 +123,7 @@ __all__ = [
     "build_engine",
     "compile_controlnet",
     "compile_unet",
+    "compile_unet_with_control",
     "compile_unet_with_controlnet",
     "compile_vae_decoder",
     "compile_vae_encoder",
@@ -124,6 +131,32 @@ __all__ = [
     "export_onnx",
     "optimize_onnx",
 ]
+
+
+def compile_unet_with_control(
+    unet,
+    model_data: BaseModel,
+    onnx_path: str,
+    onnx_opt_path: str,
+    engine_path: str,
+    opt_batch_size: int = 1,
+    engine_build_options: dict = {},
+):
+    """Build a TRT engine for UNet with ControlNet residual input slots.
+
+    Same UNet weights as the plain `compile_unet`; the difference is the
+    forward signature exposes the residuals as named inputs so ControlNet
+    output (from a separate engine) can be threaded in at runtime.
+    """
+    num_down = getattr(model_data, "num_down_residuals", 12)
+    wrapped = UNetExportWrapperWithControl(unet, num_down).to(
+        torch.device("cuda"), dtype=torch.float16
+    ).eval()
+    builder = EngineBuilder(model_data, wrapped, device=torch.device("cuda"))
+    builder.build(
+        onnx_path, onnx_opt_path, engine_path,
+        opt_batch_size=opt_batch_size, **engine_build_options,
+    )
 
 
 def compile_controlnet(
