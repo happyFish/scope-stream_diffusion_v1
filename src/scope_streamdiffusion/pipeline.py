@@ -80,6 +80,7 @@ class StreamDiffusionPipeline(Pipeline):
 
         # Load the base model
         print(f"Loading model: {model_id}")
+        self._model_id_for_trt = model_id  # cache for TRT engine path keying
         self.pipe = self._load_model(model_id)
         print(f"Model loaded: {self.pipe.__class__.__name__}")
 
@@ -90,6 +91,40 @@ class StreamDiffusionPipeline(Pipeline):
         self._full_vae = self.vae  # keep reference for toggling
         self._taesd_vae = None
         self._using_taesd = False
+
+        # legacy torch.compile flag — kept so other code paths that read
+        # `_unet_compiled` (e.g. _ensure_trt_unet's "restore eager" branch)
+        # continue to work. compile_unet schema field is gone in Phase 5.
+        self._unet_compiled: bool = False
+
+        # TAESD TRT state
+        self._trt_taesd_built: bool = False
+        self._trt_eager_taesd = None
+
+        # TRT engine state — set once on first call when acceleration_mode='trt'.
+        # self.unet is swapped to a TRT UNet adapter; self.controlnet (when
+        # controlnet_mode != 'none') is independently swapped to a TRT
+        # ControlNet adapter. Two separate engines: each fits well under
+        # ONNX's 2 GB limit individually, avoiding the combined-graph
+        # cask-convolution bug we hit trying to merge them.
+        self._trt_unet_built: bool = False
+        self._trt_unet_has_controlnet: bool = False  # legacy flag from combined-engine attempt
+        self._trt_cn_built_modes: set[str] = set()
+        self._trt_cn_engines: dict[str, Any] = {}  # mode -> TRTControlNetAdapter
+        self._trt_eager_controlnets: dict[str, Any] = {}  # mode -> diffusers ControlNetModel (fallback)
+        self._trt_cuda_stream = None
+        self._trt_eager_unet = None  # original; kept for fallback
+        self._model_id_for_trt: str | None = None
+
+        # Read acceleration_mode at init from schema defaults / load_params.
+        # The runtime kwargs path is unreliable because moth's 30fps param flood
+        # overflows scope's parameter_queue (maxsize=8) and most updates drop.
+        # An init-time read is deterministic.
+        self._acceleration_mode: str = kwargs.get("acceleration_mode", "none")
+        if self._acceleration_mode not in ("none", "trt"):
+            self._acceleration_mode = "none"
+        if self._acceleration_mode == "trt":
+            print(f"[TRT] acceleration_mode='trt' detected at init")
 
         # Check if SDXL
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
@@ -161,6 +196,207 @@ class StreamDiffusionPipeline(Pipeline):
         self._last_mode: str | None = None
 
         print("StreamDiffusion pipeline initialized")
+
+    def _ensure_trt_taesd(self) -> None:
+        """Build TRT engines for the TAESD encoder + decoder, swap self.vae.
+
+        Called only when use_taesd is on AND acceleration_mode='trt'.
+        TAESD is small so engine builds are fast (~30-60s per engine on
+        first run). One-shot per process; cached engines load instantly.
+        """
+        if self._trt_taesd_built:
+            return
+        if self._taesd_vae is None:
+            return
+        self._trt_taesd_built = True  # prevent retry on failure
+
+        from .trt_engines import (
+            TRTTaesdAdapter,
+            build_taesd_engines,
+            make_cuda_stream,
+        )
+        if self._trt_cuda_stream is None:
+            self._trt_cuda_stream = make_cuda_stream()
+        print(
+            "[TRT] Preparing TAESD engines — first build takes ~1 min, cached after",
+            flush=True,
+        )
+        try:
+            enc_path, dec_path = build_taesd_engines(
+                self._taesd_vae,
+                model_id="madebyollin/taesd",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+        except Exception as e:
+            print(f"[TRT] TAESD engine build failed, using eager: {e}")
+            return
+        scaling_factor = float(self._taesd_vae.config.scaling_factor)
+        vae_scale_factor = self.pipe.vae_scale_factor
+        adapter = TRTTaesdAdapter(
+            enc_path, dec_path, self._trt_cuda_stream,
+            scaling_factor=scaling_factor,
+            vae_scale_factor=vae_scale_factor,
+            dtype=self.dtype,
+        )
+        self._trt_eager_taesd = self._taesd_vae
+        self._taesd_vae = adapter
+        if self._using_taesd:
+            self.vae = adapter
+        print(f"[TRT] TAESD engines active: enc={enc_path.name}, dec={dec_path.name}", flush=True)
+
+    def _ensure_trt_controlnet(self, mode: str) -> None:
+        """Build (or reuse) TRT engine for the active ControlNet, swap self.controlnet.
+
+        Per-mode engine cached on disk + once built per process. Each mode
+        (depth/scribble) gets its own engine because the underlying
+        diffusers ControlNetModel weights differ. On build failure or
+        unsupported mode we leave self.controlnet as the eager model.
+        """
+        if mode in ("none", None) or self._cn.model is None:
+            return
+        if mode in self._trt_cn_built_modes:
+            # Already attempted (success or failure). Restore the engine
+            # adapter if we previously built one for this mode.
+            adapter = self._trt_cn_engines.get(mode)
+            if adapter is not None and self.controlnet is not adapter:
+                self._trt_eager_controlnets[mode] = self._cn.model
+                self.controlnet = adapter
+            return
+        self._trt_cn_built_modes.add(mode)  # mark before build to prevent retry storm
+
+        from .trt_engines import (
+            TRTControlNetAdapter,
+            build_controlnet_engine,
+            make_cuda_stream,
+        )
+
+        if self._trt_cuda_stream is None:
+            self._trt_cuda_stream = make_cuda_stream()
+
+        # ControlNet ONNX export needs default attention too (same xformers
+        # issue as the UNet path).
+        try:
+            self._cn.model.set_default_attn_processor()
+        except AttributeError:
+            pass
+
+        print(
+            f"[TRT] Preparing ControlNet engine ({mode}) — first build takes 3-5 min, cached after",
+            flush=True,
+        )
+        try:
+            engine_path = build_controlnet_engine(
+                self._cn.model,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                controlnet_id=mode,
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+        except Exception as e:
+            print(f"[TRT] ControlNet engine build failed for {mode}, using eager: {e}")
+            return
+        adapter = TRTControlNetAdapter(engine_path, self._trt_cuda_stream)
+        self._trt_eager_controlnets[mode] = self._cn.model
+        self._trt_cn_engines[mode] = adapter
+        self.controlnet = adapter
+        print(f"[TRT] ControlNet engine active ({mode}): {engine_path}", flush=True)
+
+    def _ensure_trt_unet(self, controlnet_mode: str = "none") -> None:
+        """Build TRT engine for the UNet and swap self.unet to the adapter.
+
+        Two variants depending on controlnet_mode:
+          * 'none'              → plain UNet engine (3 inputs, fastest)
+          * 'depth' | 'scribble' → UNet engine WITH ControlNet residual input
+            slots so the ControlNet output (from the standalone engine)
+            actually reaches the UNet's inner blocks. Without this, the
+            residuals get silently dropped and ControlNet conditioning has
+            no effect on the output.
+
+        Engines are cached separately on disk because they have different
+        signatures. Switching modes mid-process may trigger a rebuild.
+        """
+        want_control = controlnet_mode in ("depth", "scribble")
+
+        # If we previously built the wrong variant, rebuild now.
+        if self._trt_unet_built and self._trt_unet_has_controlnet == want_control:
+            return
+        if self._trt_unet_built and self._trt_unet_has_controlnet != want_control:
+            print(
+                f"[TRT] UNet ctrl-input variant changed "
+                f"(had={self._trt_unet_has_controlnet}, want={want_control}); rebuilding"
+            )
+
+        # Set sticky flags before the build so failures don't retry every frame.
+        self._trt_unet_built = True
+        self._trt_unet_has_controlnet = want_control
+
+        # Restore eager forward if torch.compile wrapped it earlier.
+        if self._unet_compiled:
+            self.unet = self.pipe.unet
+            self._unet_compiled = False
+
+        # xformers flash-attention ops can't be ONNX-exported.
+        try:
+            self.pipe.unet.set_default_attn_processor()
+            print("[TRT] swapped UNet to default attention for ONNX export")
+        except AttributeError:
+            try:
+                self.pipe.disable_xformers_memory_efficient_attention()
+                print("[TRT] disabled xformers on pipe for ONNX export")
+            except Exception as e:
+                print(f"[TRT] could not disable xformers attention: {e}")
+
+        from .trt_engines import (
+            TRTUNetAdapter,
+            TRTUNetWithControlAdapter,
+            build_unet_engine,
+            build_unet_with_control_engine,
+            make_cuda_stream,
+        )
+
+        if self._trt_cuda_stream is None:
+            self._trt_cuda_stream = make_cuda_stream()
+
+        if want_control:
+            print(
+                "[TRT] Preparing UNet+ctrl engine — first build takes 5-10 min, cached after",
+                flush=True,
+            )
+            engine_path = build_unet_with_control_engine(
+                self.pipe.unet,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+                num_down_residuals=12,
+            )
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = TRTUNetWithControlAdapter(
+                engine_path, self._trt_cuda_stream, num_down_residuals=12,
+            )
+            print(f"[TRT] UNet+ctrl engine active: {engine_path}", flush=True)
+        else:
+            print(
+                "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after",
+                flush=True,
+            )
+            engine_path = build_unet_engine(
+                self.pipe.unet,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
+            print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model."""
@@ -298,9 +534,6 @@ class StreamDiffusionPipeline(Pipeline):
         # --- Timestep schedule: only recompute when schedule params change ---
         schedule_key = (num_inference_steps, strength, tuple(t_index_list))
         if schedule_key != self._schedule_key:
-            print(
-                f"Using t_index_list: {t_index_list} from {num_inference_steps} total steps"
-            )
             self._set_timesteps(num_inference_steps, strength)
             self._schedule_key = schedule_key
 
@@ -870,7 +1103,9 @@ class StreamDiffusionPipeline(Pipeline):
         else:
             x_t_latent_plus_uc = x_t_latent
 
-        # Compute ControlNet residuals if conditioning is available
+        # Compute ControlNet residuals if conditioning is available.
+        # This works for all paths — eager ControlNet, TRT ControlNet — they
+        # all expose the diffusers ControlNetModel signature.
         down_block_res_samples = None
         mid_block_res_sample = None
         if self.controlnet is not None and self.controlnet_input is not None:
@@ -1029,17 +1264,14 @@ class StreamDiffusionPipeline(Pipeline):
         # Bypass: pass input through unchanged when disabled
         enabled = kwargs.get("enabled", True)
         if not enabled:
-            if video is not None and len(video) > 0:
-                frame = video[0]
-                while frame.ndim > 3:
-                    frame = frame.squeeze(0)
-                if frame.dtype == torch.uint8:
-                    frame = frame.float() / 255.0
-                return {"video": frame.unsqueeze(0)}
-            # Text mode with no input — return black frame
-            h = kwargs.get("height", self.height)
-            w = kwargs.get("width", self.width)
-            return {"video": torch.zeros(1, h, w, 3, device=self.device)}
+            if video is None or len(video) == 0:
+                return {"video": None}
+            frame = video[0]
+            while frame.ndim > 3:
+                frame = frame.squeeze(0)
+            if frame.dtype == torch.uint8:
+                frame = frame.float() / 255.0
+            return {"video": frame.unsqueeze(0)}
 
         # Detect video↔text mode transitions and self-trigger a reset so stale
         # ControlNet hidden states, EMA bounds, and prev_image_result don't bleed
@@ -1109,7 +1341,16 @@ class StreamDiffusionPipeline(Pipeline):
         depth_min = get_param("depth_min", 0)
         depth_max = get_param("depth_max", 12)
         depth_skip_interval = get_param("depth_skip_interval", 3)
-        use_taesd = get_param("use_taesd", False)
+        depth_input_size = get_param("depth_input_size", 518)
+        depth_temporal_cache = get_param("depth_temporal_cache", True)
+        depth_compile = get_param("depth_compile", False)
+        # Default True matches schema. With False the full SD VAE decode runs
+        # at ~40 ms/call vs TAESD's ~5 ms. Big perf cliff if the param isn't
+        # propagated from moth (e.g. queue-drop or absent from project file).
+        use_taesd = get_param("use_taesd", True)
+        # acceleration_mode is locked at init (see __init__) — runtime updates
+        # don't change it because TRT engines can't be hot-swapped.
+        acceleration_mode = self._acceleration_mode
 
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
         # LCM scheduler requires: floor(original_steps * strength) >= num_inference_steps
@@ -1143,9 +1384,41 @@ class StreamDiffusionPipeline(Pipeline):
             depth_min=depth_min,
             depth_max=depth_max,
             depth_skip_interval=depth_skip_interval,
+            depth_input_size=depth_input_size,
+            depth_temporal_cache=depth_temporal_cache,
+            depth_compile=depth_compile,
         )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
+
+        # TRT engine swap — UNet always, ControlNet additionally when active.
+        # Two separate engines (each <2 GB ONNX) instead of a single combined
+        # graph that hits TRT's cask-convolution bug.
+        if acceleration_mode == "trt":
+            try:
+                self._ensure_trt_unet(controlnet_mode)
+            except Exception as e:
+                print(f"[TRT] UNet engine swap failed, falling back to eager: {e}")
+                import traceback
+                traceback.print_exc()
+                if self._trt_eager_unet is not None:
+                    self.unet = self._trt_eager_unet
+            if controlnet_mode in ("depth", "scribble"):
+                try:
+                    self._ensure_trt_controlnet(controlnet_mode)
+                except Exception as e:
+                    print(f"[TRT] ControlNet engine swap failed for {controlnet_mode}, using eager: {e}")
+                    import traceback
+                    traceback.print_exc()
+            # TAESD TRT — saves ~3-5 ms vs eager TAESD (which is already fast)
+            if use_taesd:
+                try:
+                    self._ensure_trt_taesd()
+                except Exception as e:
+                    print(f"[TRT] TAESD engine swap failed, using eager: {e}")
+                    import traceback
+                    traceback.print_exc()
+
         self.controlnet_conditioning_scale = self._cn.scale
         # Extract transition (explicit transition overrides auto-transition)
         transition = kwargs.get("transition", None)
@@ -1237,6 +1510,33 @@ class StreamDiffusionPipeline(Pipeline):
         x_output = (x_output / 2 + 0.5).clamp(0, 1)
         # Convert back to Scope format: (B, C, H, W) -> (T, H, W, C)
         output = x_output.permute(0, 2, 3, 1)
+
+        # ── Mask compositing ──────────────────────────────────────────
+        # Drop-in compatible with vace_input_masks from yolo_mask / scope-sam3
+        # (shape (1, 1, F, H, W), binary). SD output where mask=1, original
+        # where mask=0; flip via the upstream segmenter's Invert Mask. Skip
+        # in pure text mode where there's no original frame to blend with.
+        mask_compositing = bool(kwargs.get("mask_compositing", False))
+        mask_strength = float(kwargs.get("mask_strength", 1.0))
+        masks_in = kwargs.get("vace_input_masks")
+        if (
+            mask_compositing
+            and mask_strength > 0
+            and masks_in is not None
+            and frame is not None
+        ):
+            m = masks_in[:, :, 0].to(device=output.device, dtype=output.dtype)
+            if m.shape[-2:] != (height, width):
+                m = torch.nn.functional.interpolate(
+                    m, size=(height, width), mode="bilinear", align_corners=False
+                )
+            mask_feather = float(kwargs.get("mask_feather", 0.0))
+            if mask_feather > 0:
+                k = max(1, int(mask_feather) * 2 + 1)
+                m = torch.nn.functional.avg_pool2d(m, k, stride=1, padding=k // 2)
+            m = (m * mask_strength).clamp(0, 1).permute(0, 2, 3, 1)  # (1,H,W,1)
+            orig = frame.unsqueeze(0).to(device=output.device, dtype=output.dtype)
+            output = m * output + (1.0 - m) * orig
 
         # Cache result
         self.prev_image_result = output

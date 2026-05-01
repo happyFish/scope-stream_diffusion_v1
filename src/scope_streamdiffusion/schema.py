@@ -32,6 +32,11 @@ class StreamDiffusionConfig(BasePipelineConfig):
 
     supports_lora = True
 
+    # Accept a mask stream from upstream segmenters (YOLO mask, SAM3 mask, etc.)
+    # in addition to video. Mask is (1, 1, F, H, W) binary; compositing happens
+    # post-SD per the mask_compositing field below.
+    inputs = ["video", "vace_input_masks"]
+
     # ========================================
     # Pipeline Control
     # ========================================
@@ -60,6 +65,18 @@ class StreamDiffusionConfig(BasePipelineConfig):
     acceleration: Literal["none", "xformers", "tensorrt"] = Field(
         default="xformers",
         description="Hardware acceleration method",
+    )
+
+    acceleration_mode: Literal["none", "trt"] = Field(
+        default="trt",
+        description=(
+            "TRT-compile UNet (and ControlNet) for ~2-3x denoising speedup. "
+            "First build per (model, batch range) takes 5-10 min and caches to "
+            "~/.cache/scope-streamdiffusion-trt/. Set at session start; changing "
+            "requires pipeline reload. Engines support dynamic resolution 256-1024 "
+            "and batch 1-4."
+        ),
+        json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
 
     use_taesd: bool = Field(
@@ -104,6 +121,24 @@ class StreamDiffusionConfig(BasePipelineConfig):
         le=10,
         description="Run depth model every Nth frame; reuse cached depth map on intermediate frames. Higher = less GPU cost, more temporal lag.",
         json_schema_extra=ui_field_config(order=7, label="Depth Skip Interval"),
+    )
+
+    depth_input_size: Literal[252, 364, 518] = Field(
+        default=518,
+        description="Resolution the depth model runs at (must be multiple of 14). Lower = faster but coarser depth. 252 ≈ 4× faster than 518; the depth map is bilinear-upsampled to controlnet resolution either way.",
+        json_schema_extra=ui_field_config(order=8, label="Depth Input Size"),
+    )
+
+    depth_temporal_cache: bool = Field(
+        default=True,
+        description="Use the video model's temporal hidden-state cache for inter-frame consistency. Disabling skips the temporal motion modules entirely (faster, slightly more flicker). Combined with skip interval > 1 the cache buys little, so toggle off for speed.",
+        json_schema_extra=ui_field_config(order=9, label="Depth Temporal Cache"),
+    )
+
+    depth_compile: bool = Field(
+        default=False,
+        description="torch.compile the depth model on first use. First call after enabling stalls 10–30s while compiling; subsequent calls are 15–30% faster. Stays compiled until the pipeline reloads.",
+        json_schema_extra=ui_field_config(order=10, label="Depth torch.compile"),
     )
 
     controlnet_temporal_smoothing: float = Field(
@@ -244,19 +279,57 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=49, label="Image Loopback"),
     )
 
-    # Resolution settings (can be overridden at runtime)
-    width: int = Field(
-        default=512,
-        ge=128,
-        le=2048,
-        description="Output width",
-        # json_schema_extra=ui_field_config(order=60, label="Width"),
+    # ========================================
+    # Mask Compositing (consumes vace_input_masks from upstream segmenter)
+    # ========================================
+
+    mask_compositing: bool = Field(
+        default=False,
+        description=(
+            "Composite SD output with the original frame using the incoming "
+            "mask. SD output goes where mask=1, original goes where mask=0. "
+            "Flip directions by toggling the upstream segmenter's Invert Mask."
+        ),
+        json_schema_extra=ui_field_config(order=55, label="Mask Compositing"),
     )
 
-    height: int = Field(
+    mask_feather: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=32.0,
+        description=(
+            "Soft mask edges (pixels). 0 = hard edge. Cheap box-blur applied "
+            "to the mask before compositing."
+        ),
+        json_schema_extra=ui_field_config(order=56, label="Mask Feather"),
+    )
+
+    mask_strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Overall mask blend strength. 0 disables compositing, 1 is full effect. "
+            "Use intermediate values to ghost the original through the SD output."
+        ),
+        json_schema_extra=ui_field_config(order=57, label="Mask Strength"),
+    )
+
+    # Resolution settings — must be a multiple of 64 (UNet downsamples latents
+    # 3x; ControlNet residuals go to /8 in latent space, so pixel dim has to
+    # divide by 64). TRT engines are built for the 256-1024 dynamic range.
+    width: Literal[
+        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    ] = Field(
         default=512,
-        ge=128,
-        le=2048,
-        description="Output height",
-        # json_schema_extra=ui_field_config(order=61, label="Height"),
+        description="Output width (multiple of 64, 256-1024)",
+        json_schema_extra=ui_field_config(order=60, label="Width"),
+    )
+
+    height: Literal[
+        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    ] = Field(
+        default=512,
+        description="Output height (multiple of 64, 256-1024)",
+        json_schema_extra=ui_field_config(order=61, label="Height"),
     )
