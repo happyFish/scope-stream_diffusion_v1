@@ -1189,7 +1189,10 @@ class StreamDiffusionPipeline(Pipeline):
         depth_input_size = get_param("depth_input_size", 518)
         depth_temporal_cache = get_param("depth_temporal_cache", True)
         depth_compile = get_param("depth_compile", False)
-        use_taesd = get_param("use_taesd", False)
+        # Default True matches schema. With False the full SD VAE decode runs
+        # at ~40 ms/call vs TAESD's ~5 ms. Big perf cliff if the param isn't
+        # propagated from moth (e.g. queue-drop or absent from project file).
+        use_taesd = get_param("use_taesd", True)
         compile_unet = get_param("compile_unet", False)
         # acceleration_mode is locked at init (see __init__) — runtime updates
         # don't change it because TRT engines can't be hot-swapped.

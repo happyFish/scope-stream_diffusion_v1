@@ -130,9 +130,16 @@ class TRTUNetAdapter:
     (UNet2DConditionOutput).
     """
 
-    def __init__(self, engine_path: Path, cuda_stream):
+    def __init__(self, engine_path: Path, cuda_stream, *, use_cuda_graph: bool = True):
         from ._trt import UNet2DConditionModelEngine
-        self.engine = UNet2DConditionModelEngine(str(engine_path), cuda_stream)
+        # use_cuda_graph: capture the engine's kernel sequence on first call
+        # and replay on subsequent calls. Eliminates ~3-5ms of TRT launch
+        # overhead per call. Shape must stay constant — changing resolution
+        # mid-stream invalidates the captured graph (would need recapture).
+        self.engine = UNet2DConditionModelEngine(
+            str(engine_path), cuda_stream, use_cuda_graph=use_cuda_graph,
+        )
+        self._use_cuda_graph = use_cuda_graph
         # Surface that pipeline.py reads
         self.config = _ConfigShim()
         self.add_embedding = None  # SD2.1: no add_embedding (SDXL would)
