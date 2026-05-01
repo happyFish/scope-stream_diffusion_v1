@@ -115,6 +115,138 @@ def build_unet_with_controlnet_engine(
     return engine_path
 
 
+def build_controlnet_engine(
+    controlnet,
+    *,
+    model_id: str,
+    controlnet_id: str,
+    image_height: int = 512,
+    image_width: int = 512,
+    min_batch_size: int = 1,
+    max_batch_size: int = 4,
+) -> Path:
+    """Build (or reuse) a standalone TRT engine for ControlNet.
+
+    Cache key includes both base model_id and controlnet_id so swapping
+    between depth/scribble ControlNets uses separate engines. The
+    diffusers ControlNetModel is wrapped to expose conditioning_scale
+    as a runtime input — one engine serves any scale without rebuild.
+    """
+    from ._trt import ControlNet, compile_controlnet, create_onnx_path
+
+    suffix = f"cn_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
+    cache_dir = _model_cache_dir(f"{model_id}::{controlnet_id}", suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "controlnet.engine"
+
+    if engine_path.exists():
+        logger.info(f"[TRT] Reusing cached ControlNet engine: {engine_path}")
+        return engine_path
+
+    logger.info(f"[TRT] Building ControlNet engine -> {engine_path} (3-5 min on first build)")
+
+    # Determine block_out_channels and num_down_residuals from the actual
+    # ControlNet config (must match the runtime inferred shapes).
+    block_out_channels = tuple(controlnet.config.block_out_channels)
+    # SD1.5/2.1: 12 down residuals. SDXL would be 9 — adjust if/when needed.
+    num_down_residuals = 12
+
+    model_data = ControlNet(
+        fp16=True,
+        device="cuda",
+        max_batch_size=max_batch_size,
+        min_batch_size=min_batch_size,
+        embedding_dim=controlnet.config.cross_attention_dim,
+        unet_dim=4,
+        num_down_residuals=num_down_residuals,
+        block_out_channels=block_out_channels,
+    )
+    compile_controlnet(
+        controlnet, model_data,
+        str(create_onnx_path("controlnet", str(onnx_dir), opt=False)),
+        str(create_onnx_path("controlnet", str(onnx_dir), opt=True)),
+        str(engine_path),
+        opt_batch_size=min_batch_size,
+        engine_build_options={
+            "build_dynamic_shape": True,
+            "build_static_batch": False,
+        },
+    )
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    logger.info(f"[TRT] ControlNet engine built: {engine_path}")
+    return engine_path
+
+
+class TRTControlNetAdapter:
+    """Drop-in for diffusers ControlNetModel.
+
+    pipeline._unet_step calls:
+        down_block_res_samples, mid_block_res_sample = self.controlnet(
+            x_t_latent_plus_uc, t_list,
+            encoder_hidden_states=embeds,
+            controlnet_cond=cond_image,
+            conditioning_scale=scale,
+            return_dict=False,
+        )
+
+    This adapter accepts the same call signature, normalises the scale
+    arg to a 1-D tensor (engine input expects shape (1,)), and forwards
+    to the TRT engine.
+    """
+
+    def __init__(self, engine_path: Path, cuda_stream, *, num_down_residuals: int = 12):
+        from ._trt import ControlNetEngine
+        self.engine = ControlNetEngine(
+            str(engine_path), cuda_stream, num_down_residuals=num_down_residuals,
+        )
+        self.config = _ConfigShim()
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
+        conditioning_scale=1.0,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+
+        if isinstance(conditioning_scale, torch.Tensor):
+            scale = conditioning_scale.to(torch.float32)
+            if scale.ndim == 0:
+                scale = scale.unsqueeze(0)
+        else:
+            scale = torch.tensor(
+                [float(conditioning_scale)], dtype=torch.float32, device=sample.device,
+            )
+
+        down, mid = self.engine(
+            sample=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_cond,
+            controlnet_scale=scale,
+        )
+        if return_dict:
+            from diffusers.models.controlnets.controlnet import ControlNetOutput
+            return ControlNetOutput(down_block_res_samples=down, mid_block_res_sample=mid)
+        return (down, mid)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+
 def build_unet_engine(
     unet: UNet2DConditionModel,
     *,
@@ -167,6 +299,10 @@ def build_unet_engine(
             "build_static_batch": False,
         },
     )
+    # ONNX intermediates can be GBs and aren't needed once the engine is built.
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
     logger.info(f"[TRT] UNet engine built: {engine_path}")
     return engine_path
 

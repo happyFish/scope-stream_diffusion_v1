@@ -221,6 +221,184 @@ class CLIP(BaseModel):
 
 
 
+class ControlNetExportWrapper(torch.nn.Module):
+    """Wraps diffusers ControlNetModel for ONNX export.
+
+    Returns the down-block residuals and mid-block residual as a flat
+    tuple of tensors so ONNX outputs are individual named tensors
+    (instead of a list, which onnx doesn't represent natively).
+
+    `controlnet_scale` is a runtime tensor input — applied as a
+    multiplier on the residuals INSIDE the model, so a single engine
+    serves any conditioning_scale at runtime without rebuild.
+    """
+
+    def __init__(self, controlnet, num_down_residuals: int):
+        super().__init__()
+        self.controlnet = controlnet
+        self.num_down_residuals = num_down_residuals
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        controlnet_cond,
+        controlnet_scale,
+    ):
+        down_samples, mid_sample = self.controlnet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_cond,
+            return_dict=False,
+        )
+        # Apply scale here (mirrors prism's pattern).
+        scaled_down = [d * controlnet_scale for d in down_samples]
+        scaled_mid = mid_sample * controlnet_scale
+        return (*scaled_down, scaled_mid)
+
+
+class ControlNet(BaseModel):
+    """TRT I/O spec for a standalone ControlNet engine.
+
+    Inputs: sample, timestep, encoder_hidden_states, controlnet_cond, controlnet_scale.
+    Outputs: down_block_res_sample_0..N, mid_block_res_sample.
+
+    SD1.5 / SD2.1: N=12 (down residuals).
+    """
+
+    def __init__(
+        self,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=768,
+        text_maxlen=77,
+        unet_dim=4,
+        num_down_residuals=12,
+        block_out_channels=(320, 640, 1280, 1280),
+    ):
+        super(ControlNet, self).__init__(
+            fp16=fp16,
+            device=device,
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim,
+            text_maxlen=text_maxlen,
+        )
+        self.unet_dim = unet_dim
+        self.num_down_residuals = num_down_residuals
+        self.block_out_channels = tuple(block_out_channels)
+        self.name = "ControlNet"
+
+    def get_input_names(self):
+        return [
+            "sample",
+            "timestep",
+            "encoder_hidden_states",
+            "controlnet_cond",
+            "controlnet_scale",
+        ]
+
+    def get_output_names(self):
+        return [
+            f"down_block_res_sample_{i}" for i in range(self.num_down_residuals)
+        ] + ["mid_block_res_sample"]
+
+    def get_dynamic_axes(self):
+        axes = {
+            "sample": {0: "2B", 2: "H", 3: "W"},
+            "timestep": {0: "2B"},
+            "encoder_hidden_states": {0: "2B"},
+            "controlnet_cond": {0: "2B", 2: "8H", 3: "8W"},
+            "mid_block_res_sample": {0: "2B"},
+        }
+        for i in range(self.num_down_residuals):
+            axes[f"down_block_res_sample_{i}"] = {0: "2B"}
+        return axes
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        (
+            min_batch,
+            max_batch,
+            min_image_height,
+            max_image_height,
+            min_image_width,
+            max_image_width,
+            min_latent_height,
+            max_latent_height,
+            min_latent_width,
+            max_latent_width,
+        ) = self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+        return {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+            "controlnet_cond": [
+                (min_batch, 3, min_image_height, min_image_width),
+                (batch_size, 3, image_height, image_width),
+                (max_batch, 3, max_image_height, max_image_width),
+            ],
+            "controlnet_scale": [(1,), (1,), (1,)],
+        }
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        d = {
+            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (2 * batch_size,),
+            "encoder_hidden_states": (2 * batch_size, self.text_maxlen, self.embedding_dim),
+            "controlnet_cond": (2 * batch_size, 3, image_height, image_width),
+            "controlnet_scale": (1,),
+            "mid_block_res_sample": (2 * batch_size, self.block_out_channels[-1], latent_height // 8, latent_width // 8),
+        }
+        # down residual shapes follow the SD UNet down-block pattern:
+        # SD1.5/2.1 with block_out_channels=(320, 640, 1280, 1280):
+        #   block 0 (320): h, h, h/2
+        #   block 1 (640): h/2, h/2, h/4
+        #   block 2 (1280): h/4, h/4, h/8
+        #   block 3 (1280): h/8, h/8, h/8
+        # Total: 12 residuals.
+        chans = self.block_out_channels
+        if len(chans) == 4 and self.num_down_residuals == 12:
+            spec = [
+                (chans[0], 1), (chans[0], 1), (chans[0], 1),
+                (chans[0], 2), (chans[1], 2), (chans[1], 2),
+                (chans[1], 4), (chans[2], 4), (chans[2], 4),
+                (chans[2], 8), (chans[3], 8), (chans[3], 8),
+            ]
+        else:
+            # Fall back to symmetric guess; engine builder will catch mismatches.
+            spec = [(chans[0], 1)] * self.num_down_residuals
+        for i, (c, ds) in enumerate(spec):
+            d[f"down_block_res_sample_{i}"] = (
+                2 * batch_size, c, latent_height // ds, latent_width // ds,
+            )
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        return (
+            torch.randn(2 * batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device),
+            torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
+            torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            torch.randn(2 * batch_size, 3, image_height, image_width, dtype=torch.float32, device=self.device),
+            torch.tensor([1.0], dtype=torch.float32, device=self.device),
+        )
+
+
 # moved from inside CLIP (was misplaced under it in prism's source).
 class UNet2DConditionSingleControlNetModel(torch.nn.Module):
     """UNet + single ControlNet wrapped as one nn.Module for ONNX export.

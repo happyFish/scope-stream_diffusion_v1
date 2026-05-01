@@ -123,6 +123,95 @@ class UNetWithControlNetEngine:
         pass
 
 
+class ControlNetEngine:
+    """Runtime wrapper for a standalone ControlNet TRT engine.
+
+    Mimics diffusers ControlNetModel.__call__ — takes the same kwargs and
+    returns ``(down_block_res_samples, mid_block_res_sample)``.
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        stream: cuda.Stream,
+        num_down_residuals: int,
+        use_cuda_graph: bool = False,
+    ):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.use_cuda_graph = use_cuda_graph
+        self.num_down_residuals = num_down_residuals
+        self.engine.load()
+        self.engine.activate()
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
+        controlnet_scale: torch.Tensor,
+        **kwargs,
+    ) -> Any:
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+        if controlnet_scale.dtype != torch.float32:
+            controlnet_scale = controlnet_scale.float()
+        if controlnet_cond.dtype != torch.float32:
+            controlnet_cond = controlnet_cond.float()
+
+        # Compute output residual shapes from sample shape (latent space).
+        B, _, lH, lW = sample.shape
+        # (channels, downsample_factor) per residual — must match
+        # ControlNet.get_shape_dict in models.py.
+        # block_out_channels=(320, 640, 1280, 1280) for SD1.5/2.1 standard.
+        chans = (320, 640, 1280, 1280)
+        spec = [
+            (chans[0], 1), (chans[0], 1), (chans[0], 1),
+            (chans[0], 2), (chans[1], 2), (chans[1], 2),
+            (chans[1], 4), (chans[2], 4), (chans[2], 4),
+            (chans[2], 8), (chans[3], 8), (chans[3], 8),
+        ]
+        shape_dict: Dict[str, tuple] = {
+            "sample": sample.shape,
+            "timestep": timestep.shape,
+            "encoder_hidden_states": encoder_hidden_states.shape,
+            "controlnet_cond": controlnet_cond.shape,
+            "controlnet_scale": controlnet_scale.shape,
+            "mid_block_res_sample": (B, chans[-1], max(1, lH // 8), max(1, lW // 8)),
+        }
+        for i, (c, ds) in enumerate(spec):
+            shape_dict[f"down_block_res_sample_{i}"] = (
+                B, c, max(1, lH // ds), max(1, lW // ds),
+            )
+
+        self.engine.allocate_buffers(shape_dict=shape_dict, device=sample.device)
+        out = self.engine.infer(
+            {
+                "sample": sample,
+                "timestep": timestep,
+                "encoder_hidden_states": encoder_hidden_states,
+                "controlnet_cond": controlnet_cond,
+                "controlnet_scale": controlnet_scale,
+            },
+            self.stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        down_residuals = [
+            out[f"down_block_res_sample_{i}"] for i in range(self.num_down_residuals)
+        ]
+        mid_residual = out["mid_block_res_sample"]
+        return down_residuals, mid_residual
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
 class AutoencoderKLEngine:
     def __init__(
         self,

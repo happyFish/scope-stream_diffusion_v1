@@ -99,12 +99,16 @@ class StreamDiffusionPipeline(Pipeline):
         self._compiled_controlnet_ids: set[int] = set()
 
         # TRT engine state — set once on first call when acceleration_mode='trt'.
-        # Engines stay loaded until the pipeline reloads. Self.unet gets swapped
-        # to either TRTUNetAdapter (no controlnet) or TRTUNetControlNetAdapter
-        # (combined UNet+ControlNet engine — the latter eliminates the separate
-        # ControlNet UNet pass per step).
+        # self.unet is swapped to a TRT UNet adapter; self.controlnet (when
+        # controlnet_mode != 'none') is independently swapped to a TRT
+        # ControlNet adapter. Two separate engines: each fits well under
+        # ONNX's 2 GB limit individually, avoiding the combined-graph
+        # cask-convolution bug we hit trying to merge them.
         self._trt_unet_built: bool = False
-        self._trt_unet_has_controlnet: bool = False
+        self._trt_unet_has_controlnet: bool = False  # legacy flag from combined-engine attempt
+        self._trt_cn_built_modes: set[str] = set()
+        self._trt_cn_engines: dict[str, Any] = {}  # mode -> TRTControlNetAdapter
+        self._trt_eager_controlnets: dict[str, Any] = {}  # mode -> diffusers ControlNetModel (fallback)
         self._trt_cuda_stream = None
         self._trt_eager_unet = None  # original; kept for fallback
         self._model_id_for_trt: str | None = None
@@ -189,6 +193,65 @@ class StreamDiffusionPipeline(Pipeline):
         self._last_mode: str | None = None
 
         print("StreamDiffusion pipeline initialized")
+
+    def _ensure_trt_controlnet(self, mode: str) -> None:
+        """Build (or reuse) TRT engine for the active ControlNet, swap self.controlnet.
+
+        Per-mode engine cached on disk + once built per process. Each mode
+        (depth/scribble) gets its own engine because the underlying
+        diffusers ControlNetModel weights differ. On build failure or
+        unsupported mode we leave self.controlnet as the eager model.
+        """
+        if mode in ("none", None) or self._cn.model is None:
+            return
+        if mode in self._trt_cn_built_modes:
+            # Already attempted (success or failure). Restore the engine
+            # adapter if we previously built one for this mode.
+            adapter = self._trt_cn_engines.get(mode)
+            if adapter is not None and self.controlnet is not adapter:
+                self._trt_eager_controlnets[mode] = self._cn.model
+                self.controlnet = adapter
+            return
+        self._trt_cn_built_modes.add(mode)  # mark before build to prevent retry storm
+
+        from .trt_engines import (
+            TRTControlNetAdapter,
+            build_controlnet_engine,
+            make_cuda_stream,
+        )
+
+        if self._trt_cuda_stream is None:
+            self._trt_cuda_stream = make_cuda_stream()
+
+        # ControlNet ONNX export needs default attention too (same xformers
+        # issue as the UNet path).
+        try:
+            self._cn.model.set_default_attn_processor()
+        except AttributeError:
+            pass
+
+        print(
+            f"[TRT] Preparing ControlNet engine ({mode}) — first build takes 3-5 min, cached after",
+            flush=True,
+        )
+        try:
+            engine_path = build_controlnet_engine(
+                self._cn.model,
+                model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
+                controlnet_id=mode,
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+        except Exception as e:
+            print(f"[TRT] ControlNet engine build failed for {mode}, using eager: {e}")
+            return
+        adapter = TRTControlNetAdapter(engine_path, self._trt_cuda_stream)
+        self._trt_eager_controlnets[mode] = self._cn.model
+        self._trt_cn_engines[mode] = adapter
+        self.controlnet = adapter
+        print(f"[TRT] ControlNet engine active ({mode}): {engine_path}", flush=True)
 
     def _ensure_trt_unet(self, controlnet_mode: str = "none") -> None:
         """Build TRT engine for the UNet and swap self.unet to the adapter.
@@ -1264,23 +1327,25 @@ class StreamDiffusionPipeline(Pipeline):
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
 
-        # TRT engine swap — runs once per controlnet variant when
-        # acceleration_mode='trt'. With controlnet_mode in {depth,scribble},
-        # builds a combined UNet+ControlNet engine that handles both models in
-        # a single forward, eliminating the separate ControlNet pass.
+        # TRT engine swap — UNet always, ControlNet additionally when active.
+        # Two separate engines (each <2 GB ONNX) instead of a single combined
+        # graph that hits TRT's cask-convolution bug.
         if acceleration_mode == "trt":
             try:
                 self._ensure_trt_unet(controlnet_mode)
             except Exception as e:
-                print(f"[TRT] Engine swap failed, falling back to eager: {e}")
+                print(f"[TRT] UNet engine swap failed, falling back to eager: {e}")
                 import traceback
                 traceback.print_exc()
-                # Roll back to eager UNet + eager ControlNet path so _unet_step
-                # doesn't try the combined-engine call signature on a diffusers
-                # UNet (which would error with 'unexpected keyword controlnet_image').
-                self._trt_unet_has_controlnet = False
                 if self._trt_eager_unet is not None:
                     self.unet = self._trt_eager_unet
+            if controlnet_mode in ("depth", "scribble"):
+                try:
+                    self._ensure_trt_controlnet(controlnet_mode)
+                except Exception as e:
+                    print(f"[TRT] ControlNet engine swap failed for {controlnet_mode}, using eager: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # torch.compile UNet (and current ControlNet) on first observed True.
         # Compile the bound forward methods so diffusers' Module.__call__ path

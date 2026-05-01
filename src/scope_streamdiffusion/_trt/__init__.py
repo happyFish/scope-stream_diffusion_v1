@@ -20,10 +20,17 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .builder import EngineBuilder, create_onnx_path
-from .engine import AutoencoderKLEngine, UNet2DConditionModelEngine, UNetWithControlNetEngine
+from .engine import (
+    AutoencoderKLEngine,
+    ControlNetEngine,
+    UNet2DConditionModelEngine,
+    UNetWithControlNetEngine,
+)
 from .models import (
     VAE,
     BaseModel,
+    ControlNet,
+    ControlNetExportWrapper,
     UNet,
     UNet2DConditionSingleControlNetModel,
     UNetWithControlNet,
@@ -94,6 +101,9 @@ def compile_unet(
 __all__ = [
     "AutoencoderKLEngine",
     "BaseModel",
+    "ControlNet",
+    "ControlNetEngine",
+    "ControlNetExportWrapper",
     "Engine",
     "EngineBuilder",
     "TorchVAEEncoder",
@@ -105,6 +115,7 @@ __all__ = [
     "VAE",
     "VAEEncoder",
     "build_engine",
+    "compile_controlnet",
     "compile_unet",
     "compile_unet_with_controlnet",
     "compile_vae_decoder",
@@ -113,6 +124,35 @@ __all__ = [
     "export_onnx",
     "optimize_onnx",
 ]
+
+
+def compile_controlnet(
+    controlnet,
+    model_data: BaseModel,
+    onnx_path: str,
+    onnx_opt_path: str,
+    engine_path: str,
+    opt_batch_size: int = 1,
+    engine_build_options: dict = {},
+):
+    """Build a standalone TRT engine for a single ControlNet.
+
+    Wraps the diffusers ControlNetModel in `ControlNetExportWrapper`
+    (which makes conditioning_scale a runtime input and unpacks the
+    residual list into named tensors), then runs the standard
+    export → optimize → engine build pipeline. ControlNet is small
+    enough (~700MB) that the prism Optimizer's 2GB shape-inference
+    limit isn't a problem here.
+    """
+    num_down = getattr(model_data, "num_down_residuals", 12)
+    wrapped = ControlNetExportWrapper(controlnet, num_down).to(
+        torch.device("cuda"), dtype=torch.float16
+    ).eval()
+    builder = EngineBuilder(model_data, wrapped, device=torch.device("cuda"))
+    builder.build(
+        onnx_path, onnx_opt_path, engine_path,
+        opt_batch_size=opt_batch_size, **engine_build_options,
+    )
 
 
 def compile_unet_with_controlnet(
