@@ -219,46 +219,48 @@ class CLIP(BaseModel):
         opt.info(self.name + ": finished")
         return opt_onnx_graph
 
-    class UNet2DConditionControlNetModel(torch.nn.Module):
-        def __init__(self, unet, controlnets) -> None:
-            super().__init__()
-            self.unet = unet
-            self.controlnets = controlnets
 
-        def forward(self, sample, timestep, encoder_hidden_states, images, controlnet_scales):
-            for i, (image, conditioning_scale, controlnet) in enumerate(zip(images, controlnet_scales, self.controlnets)):
-                down_samples, mid_sample = controlnet(
-                    sample,
-                    timestep,
-                    encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=image,
-                    return_dict=False,
-                )
 
-                down_samples = [
-                        down_sample * conditioning_scale
-                        for down_sample in down_samples
-                    ]
-                mid_sample *= conditioning_scale
+# moved from inside CLIP (was misplaced under it in prism's source).
+class UNet2DConditionSingleControlNetModel(torch.nn.Module):
+    """UNet + single ControlNet wrapped as one nn.Module for ONNX export.
 
-                # merge samples
-                if i == 0:
-                    down_block_res_samples, mid_block_res_sample = down_samples, mid_sample
-                else:
-                    down_block_res_samples = [
-                        samples_prev + samples_curr
-                        for samples_prev, samples_curr in zip(down_block_res_samples, down_samples)
-                    ]
-                    mid_block_res_sample += mid_sample
+    Forward takes the conditioning image and a runtime scale tensor — the
+    scale is NOT baked in, so a single TRT engine can serve any LoRA-style
+    conditioning_scale at runtime without rebuild.
+    """
 
-            noise_pred = self.unet(
-                sample,
-                timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample
-            )
-            return noise_pred
+    def __init__(self, unet, controlnet) -> None:
+        super().__init__()
+        self.unet = unet
+        self.controlnet = controlnet
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        controlnet_image,
+        controlnet_scale,
+    ):
+        down_samples, mid_sample = self.controlnet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_image,
+            return_dict=False,
+        )
+        down_samples = [d * controlnet_scale for d in down_samples]
+        mid_sample = mid_sample * controlnet_scale
+        noise_pred = self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=down_samples,
+            mid_block_additional_residual=mid_sample,
+            return_dict=False,
+        )[0]
+        return noise_pred
 
 
 class UNet(BaseModel):
@@ -343,6 +345,113 @@ class UNet(BaseModel):
             ),
             torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
             torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+        )
+
+
+class UNetWithControlNet(BaseModel):
+    """I/O spec for the combined UNet + single-ControlNet TRT engine.
+
+    Adds two runtime inputs vs plain UNet:
+      controlnet_image — RGB conditioning image (B, 3, H, W) at output res
+      controlnet_scale — scalar (1,) multiplier for the residuals
+    """
+
+    def __init__(
+        self,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=768,
+        text_maxlen=77,
+        unet_dim=4,
+    ):
+        super(UNetWithControlNet, self).__init__(
+            fp16=fp16,
+            device=device,
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim,
+            text_maxlen=text_maxlen,
+        )
+        self.unet_dim = unet_dim
+        self.name = "UNetWithControlNet"
+
+    def get_input_names(self):
+        return [
+            "sample",
+            "timestep",
+            "encoder_hidden_states",
+            "controlnet_image",
+            "controlnet_scale",
+        ]
+
+    def get_output_names(self):
+        return ["latent"]
+
+    def get_dynamic_axes(self):
+        return {
+            "sample": {0: "2B", 2: "H", 3: "W"},
+            "timestep": {0: "2B"},
+            "encoder_hidden_states": {0: "2B"},
+            "controlnet_image": {0: "2B", 2: "8H", 3: "8W"},
+            "latent": {0: "2B", 2: "H", 3: "W"},
+        }
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        (
+            min_batch,
+            max_batch,
+            min_image_height,
+            max_image_height,
+            min_image_width,
+            max_image_width,
+            min_latent_height,
+            max_latent_height,
+            min_latent_width,
+            max_latent_width,
+        ) = self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+        return {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+            "controlnet_image": [
+                (min_batch, 3, min_image_height, min_image_width),
+                (batch_size, 3, image_height, image_width),
+                (max_batch, 3, max_image_height, max_image_width),
+            ],
+            "controlnet_scale": [(1,), (1,), (1,)],
+        }
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        return {
+            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (2 * batch_size,),
+            "encoder_hidden_states": (2 * batch_size, self.text_maxlen, self.embedding_dim),
+            "controlnet_image": (2 * batch_size, 3, image_height, image_width),
+            "controlnet_scale": (1,),
+            "latent": (2 * batch_size, 4, latent_height, latent_width),
+        }
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        return (
+            torch.randn(2 * batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device),
+            torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
+            torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            torch.randn(2 * batch_size, 3, image_height, image_width, dtype=torch.float32, device=self.device),
+            torch.tensor([1.0], dtype=torch.float32, device=self.device),
         )
 
 

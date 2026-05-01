@@ -56,6 +56,73 @@ class UNet2DConditionModelEngine:
         pass
 
 
+class UNetWithControlNetEngine:
+    """Runtime wrapper for the combined UNet+ControlNet engine.
+
+    Inputs match UNetWithControlNet.get_input_names():
+      sample (B, 4, lh, lw)
+      timestep (B,)
+      encoder_hidden_states (B, 77, embed_dim)
+      controlnet_image (B, 3, H, W)
+      controlnet_scale (1,)
+    Output: latent (B, 4, lh, lw) — same as the ControlNet-modulated UNet.
+    """
+
+    def __init__(self, filepath: str, stream: cuda.Stream, use_cuda_graph: bool = False):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.use_cuda_graph = use_cuda_graph
+        self.engine.load()
+        self.engine.activate()
+
+    def __call__(
+        self,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_image: torch.Tensor,
+        controlnet_scale: torch.Tensor,
+        **kwargs,
+    ) -> Any:
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+        if controlnet_scale.dtype != torch.float32:
+            controlnet_scale = controlnet_scale.float()
+        if controlnet_image.dtype != torch.float32:
+            controlnet_image = controlnet_image.float()
+
+        self.engine.allocate_buffers(
+            shape_dict={
+                "sample": latent_model_input.shape,
+                "timestep": timestep.shape,
+                "encoder_hidden_states": encoder_hidden_states.shape,
+                "controlnet_image": controlnet_image.shape,
+                "controlnet_scale": controlnet_scale.shape,
+                "latent": latent_model_input.shape,
+            },
+            device=latent_model_input.device,
+        )
+
+        noise_pred = self.engine.infer(
+            {
+                "sample": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": encoder_hidden_states,
+                "controlnet_image": controlnet_image,
+                "controlnet_scale": controlnet_scale,
+            },
+            self.stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )["latent"]
+        return UNet2DConditionOutput(sample=noise_pred)
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
 class AutoencoderKLEngine:
     def __init__(
         self,
