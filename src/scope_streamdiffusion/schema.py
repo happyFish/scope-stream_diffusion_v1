@@ -67,6 +67,18 @@ class StreamDiffusionConfig(BasePipelineConfig):
         description="Hardware acceleration method",
     )
 
+    acceleration_mode: Literal["none", "trt"] = Field(
+        default="none",
+        description=(
+            "TRT-compile UNet (and ControlNet) for ~2-3x denoising speedup. "
+            "First build per (model, batch range) takes 5-10 min and caches to "
+            "~/.cache/scope-streamdiffusion-trt/. Set at session start; changing "
+            "requires pipeline reload. Engines support dynamic resolution 256-1024 "
+            "and batch 1-4."
+        ),
+        json_schema_extra=ui_field_config(order=2, label="Acceleration"),
+    )
+
     use_taesd: bool = Field(
         default=True,
         description="Use Tiny AutoEncoder (TAESD) for ~10x faster VAE decoding at slight quality cost",
