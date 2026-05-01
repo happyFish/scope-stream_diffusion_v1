@@ -53,7 +53,6 @@ class ControlNetHandler:
         self.dtype = dtype
         self._controlnet_cache: dict[str, ControlNetModel] = {}
         self._depth_model = None
-        self._depth_compiled: bool = False
         self._depth_hidden_state = None
         self._last_depth_shape: tuple[int, int] | None = None
         self._depth_min_ema: float | None = None
@@ -100,7 +99,6 @@ class ControlNetHandler:
         depth_skip_interval: int = 3,
         depth_input_size: int = 518,
         depth_temporal_cache: bool = True,
-        depth_compile: bool = False,
     ) -> None:
         """Update ControlNet state for the current frame.
 
@@ -130,7 +128,6 @@ class ControlNetHandler:
         if bool(depth_temporal_cache) != self._use_depth_temporal_cache:
             self._depth_hidden_state = None
             self._use_depth_temporal_cache = bool(depth_temporal_cache)
-        self._depth_compile_requested = bool(depth_compile)
 
         if mode == "depth" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("depth")
@@ -322,18 +319,6 @@ class ControlNetHandler:
             )
             self._depth_model = model.to(device=self.device).half().eval()
             print("[Depth] Model loaded")
-
-        # depth_compile is currently a no-op. torch.compile(mode="reduce-overhead")
-        # wraps the model in CUDA Graph stream capture, which conflicts with
-        # every other CUDA op in the process (TRT engine allocations, xformers
-        # attention, even plain torch.empty) — see "cudaErrorStreamCaptureImplicit".
-        # Re-enabling requires upstream scope's VideoDepthAnything to call
-        # torch.compiler.cudagraph_mark_step_begin() between invocations. Until
-        # then the knob stays disabled to prevent session-wide CUDA poisoning;
-        # once a session has compiled the depth model, no other model can run.
-        if getattr(self, "_depth_compile_requested", False) and not self._depth_compiled:
-            print("[Depth] depth_compile=true ignored — broken under TRT/xformers (scope upstream needs cudagraph_mark_step_begin)")
-            self._depth_compiled = True  # don't log on every call
         return self._depth_model
 
     def _run_depth_inference_direct(
