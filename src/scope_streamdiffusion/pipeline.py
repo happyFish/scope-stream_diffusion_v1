@@ -108,6 +108,16 @@ class StreamDiffusionPipeline(Pipeline):
         self._trt_controlnet_engines: dict[str, Any] = {}  # mode -> TRTControlNetAdapter
         self._model_id_for_trt: str | None = None
 
+        # Read acceleration_mode at init from schema defaults / load_params.
+        # The runtime kwargs path is unreliable because moth's 30fps param flood
+        # overflows scope's parameter_queue (maxsize=8) and most updates drop.
+        # An init-time read is deterministic.
+        self._acceleration_mode: str = kwargs.get("acceleration_mode", "none")
+        if self._acceleration_mode not in ("none", "trt"):
+            self._acceleration_mode = "none"
+        if self._acceleration_mode == "trt":
+            print(f"[TRT] acceleration_mode='trt' detected at init")
+
         # Check if SDXL
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
 
@@ -180,35 +190,47 @@ class StreamDiffusionPipeline(Pipeline):
         print("StreamDiffusion pipeline initialized")
 
     def _ensure_trt_unet(self) -> None:
-        """Build TRT UNet engine (with ControlNet input slots) and swap in.
+        """Build TRT UNet engine and swap self.unet to the engine adapter.
 
-        One-shot: runs once per process regardless of success — failure does
-        NOT retry on every frame. Engine is cached on disk so subsequent
-        process restarts skip the multi-minute build.
+        One-shot per process: sets a sticky flag immediately so a build
+        failure doesn't retry on every frame. Engine is cached on disk so
+        subsequent process restarts skip the multi-minute build.
+
+        ControlNet residuals are dropped by the current engine (vendored
+        prism path is plain UNet only). For controlnet=depth modes set
+        acceleration_mode='none' until the combined UNet+ControlNet engine
+        lands in Phase 3.
         """
         if self._trt_unet_built:
             return
-        # Set flag immediately to prevent retry storm on failure.
-        self._trt_unet_built = True
+        self._trt_unet_built = True  # prevent retry storm on failure
 
-        # If torch.compile already wrapped self.unet.forward, the dynamo
-        # wrapper breaks ONNX tracing. Restore the eager forward before export.
-        if hasattr(self.unet.forward, "_orig_fn"):
-            self.unet.forward = self.unet.forward._orig_fn  # type: ignore[attr-defined]
-        elif self._unet_compiled:
-            # We may have compiled forward earlier; reload the eager module from
-            # the original pipe to be safe.
+        # Restore eager forward if torch.compile wrapped it earlier.
+        if self._unet_compiled:
             self.unet = self.pipe.unet
             self._unet_compiled = False
 
-        from .trt_engines import (
-            TRTUNetAdapter,
-            build_unet_engine,
-            make_cuda_stream,
-        )
-        print("[TRT] Preparing UNet engine — first build takes 5-10 min, cached after")
+        # xformers flash-attention ops can't be ONNX-exported. Swap to default
+        # attention processors before tracing — TRT's own kernels are faster
+        # than xformers anyway, so we don't lose anything.
+        try:
+            self.unet.set_default_attn_processor()
+            print("[TRT] swapped UNet to default attention for ONNX export")
+        except AttributeError:
+            try:
+                self.pipe.disable_xformers_memory_efficient_attention()
+                print("[TRT] disabled xformers on pipe for ONNX export")
+            except Exception as e:
+                print(f"[TRT] could not disable xformers attention: {e}")
+
+        from .trt_engines import TRTUNetAdapter, build_unet_engine, make_cuda_stream
+
+        print("[TRT] Preparing UNet engine — first build takes 5-10 min, cached after", flush=True)
         if self._trt_cuda_stream is None:
+            print("[TRT] creating cuda stream...", flush=True)
             self._trt_cuda_stream = make_cuda_stream()
+            print("[TRT] cuda stream created", flush=True)
+        print(f"[TRT] calling build_unet_engine (h={self.height}, w={self.width})...", flush=True)
         engine_path = build_unet_engine(
             self.unet,
             model_id=self._model_id_for_trt or "stabilityai/sd-turbo",
@@ -216,57 +238,12 @@ class StreamDiffusionPipeline(Pipeline):
             image_width=int(self.width),
             min_batch_size=1,
             max_batch_size=4,
-            use_control=True,  # always-on slots; pass zeros when CN disabled
-            embedding_dim=self.unet.config.cross_attention_dim,
         )
-        self._trt_eager_unet = self.unet  # keep for fallback
-        self.unet = TRTUNetAdapter(
-            engine_path, self._trt_cuda_stream, use_control=True
-        )
-        print(f"[TRT] UNet engine active: {engine_path}")
-
-    def _ensure_trt_controlnet(self, mode: str) -> None:
-        """Build TRT ControlNet engine for the given mode and swap in.
-
-        Per-mode caching so 'depth' and 'scribble' get their own engines.
-        Records None on failure so we don't retry on every frame.
-        """
-        if mode == "none" or self._cn.model is None:
-            return
-        if mode in self._trt_controlnet_engines and self._trt_controlnet_engines[mode] is None:
-            return  # build was already attempted and failed; using eager
-        if mode in self._trt_controlnet_engines:
-            # Already built — swap if we're currently on a different mode's engine.
-            if self.controlnet is not self._trt_controlnet_engines[mode]:
-                self._trt_eager_controlnets[mode] = self._cn.model
-                self.controlnet = self._trt_controlnet_engines[mode]
-            return
-        from .trt_engines import (
-            TRTControlNetAdapter,
-            build_controlnet_engine,
-            make_cuda_stream,
-        )
-        print(f"[TRT] Preparing ControlNet engine ({mode}) — 3-5 min on first build")
-        if self._trt_cuda_stream is None:
-            self._trt_cuda_stream = make_cuda_stream()
-        try:
-            engine_path = build_controlnet_engine(
-                self._cn.model,
-                model_id=f"{self._model_id_for_trt or 'sd-turbo'}/{mode}",
-                image_height=int(self.height),
-                image_width=int(self.width),
-                min_batch_size=1,
-                max_batch_size=4,
-            )
-        except Exception as e:
-            print(f"[TRT] ControlNet engine build failed for {mode}, using eager: {e}")
-            self._trt_controlnet_engines[mode] = None  # mark as failed to skip future retries
-            return
-        adapter = TRTControlNetAdapter(engine_path, self._trt_cuda_stream)
-        self._trt_eager_controlnets[mode] = self._cn.model
-        self._trt_controlnet_engines[mode] = adapter
-        self.controlnet = adapter
-        print(f"[TRT] ControlNet engine active ({mode}): {engine_path}")
+        print(f"[TRT] build_unet_engine returned: {engine_path}", flush=True)
+        self._trt_eager_unet = self.unet  # keep eager copy for fallback / debug
+        print("[TRT] instantiating TRTUNetAdapter...", flush=True)
+        self.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
+        print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model."""
@@ -1214,7 +1191,9 @@ class StreamDiffusionPipeline(Pipeline):
         depth_compile = get_param("depth_compile", False)
         use_taesd = get_param("use_taesd", False)
         compile_unet = get_param("compile_unet", False)
-        acceleration_mode = get_param("acceleration_mode", "none")
+        # acceleration_mode is locked at init (see __init__) — runtime updates
+        # don't change it because TRT engines can't be hot-swapped.
+        acceleration_mode = self._acceleration_mode
 
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
         # LCM scheduler requires: floor(original_steps * strength) >= num_inference_steps
@@ -1257,12 +1236,10 @@ class StreamDiffusionPipeline(Pipeline):
 
         # TRT engine swap — runs once when acceleration_mode='trt' and the
         # pipeline has settled on its target H/W (so the engine builds for the
-        # right opt-resolution). UNet always builds; ControlNet builds per mode.
+        # right opt-resolution).
         if acceleration_mode == "trt":
             try:
                 self._ensure_trt_unet()
-                if controlnet_mode in ("depth", "scribble") and self._cn.model is not None:
-                    self._ensure_trt_controlnet(controlnet_mode)
             except Exception as e:
                 print(f"[TRT] Engine swap failed, falling back to eager: {e}")
                 import traceback

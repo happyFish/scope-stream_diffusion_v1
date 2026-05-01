@@ -1,51 +1,57 @@
-"""TensorRT engine builder + adapter classes for StreamDiffusion.
+"""TensorRT engine builder + adapter classes.
 
-In-place TRT acceleration: rather than migrating to StreamDiffusion's
-StreamDiffusionWrapper, we use its low-level engine builders to produce
-TRT engines for the UNet and ControlNet, then wrap those engines as
-drop-in replacements for the diffusers nn.Modules.
+In-place TRT acceleration. Uses our vendored `_trt/` exporter
+(originally from prism) to compile UNet to a TensorRT engine, then swaps
+in a thin adapter that mimics the diffusers `UNet2DConditionModel` call
+signature so the rest of `pipeline.py` is unchanged.
 
-Engines cache in ~/.cache/scope-streamdiffusion-trt/{model_hash}/.
-First-run build takes 5-10 min per engine. Subsequent runs reuse the
-cached engines (~2s load).
+Engines cache to ~/.cache/scope-streamdiffusion-trt/{model_hash}/.
+First-run build: 5-10 min. Subsequent runs reuse the engine (~2 s load).
 
-Dynamic shapes: spatial dims 256-1024, batch 1-4 (covers CFG on/off
-and frame buffering). One engine covers the whole range — no rebuild
-on resolution change.
+Dynamic shapes: spatial 256-1024, batch min..max. One engine covers the
+range — no rebuild on resolution change.
+
+NOTE: ControlNet residuals are NOT yet wired through the UNet engine.
+The vendored UNet engine ignores `down_block_additional_residuals` /
+`mid_block_additional_residual` (they go into **kwargs and get dropped).
+For controlnet=depth/scribble modes, use acceleration_mode='none' until
+Phase 3 lands the combined UNet+ControlNet engine.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from pathlib import Path
-from typing import Any, Optional
 
 import torch
-from diffusers import ControlNetModel, UNet2DConditionModel
+from diffusers import UNet2DConditionModel
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Cache locations ────────────────────────────────────────────────────────
+# IMPORTANT — Scope must be launched with LD_LIBRARY_PATH including BOTH:
+#   * $VENV/lib/python3.12/site-packages/nvidia/cudnn/lib (cuDNN runtime)
+#   * $VENV/lib/python3.12/site-packages/tensorrt_libs    (libnvinfer_builder_resource_sm*.so)
+#
+# Without the latter, TRT's engine builder fails to dlopen the per-SM kernel
+# library at build time and aborts with:
+#   Error Code 6: Unable to load library: libnvinfer_builder_resource_sm89.so
+# Setting LD_LIBRARY_PATH at runtime via os.environ doesn't help — the dynamic
+# linker reads it once at process start, and tensorrt_libs's ctypes preload
+# only covers the libs it knows about up front, not the lazy per-SM dlopens.
 
 
 def _cache_root() -> Path:
-    """Where engine + onnx artifacts live across runs."""
     return Path.home() / ".cache" / "scope-streamdiffusion-trt"
 
 
 def _model_cache_dir(model_id: str, suffix: str = "") -> Path:
-    """One subdir per model checkpoint; survive across pipeline restarts."""
     h = hashlib.sha256(model_id.encode()).hexdigest()[:16]
     name = f"{h}_{suffix}" if suffix else h
     d = _cache_root() / name
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-# ─── Engine builders ────────────────────────────────────────────────────────
 
 
 def build_unet_engine(
@@ -56,172 +62,61 @@ def build_unet_engine(
     image_width: int = 512,
     min_batch_size: int = 1,
     max_batch_size: int = 4,
-    use_control: bool = False,
-    embedding_dim: int = 1024,  # SD2.1: 1024, SD1.5: 768, SDXL: 2048
-    text_maxlen: int = 77,
 ) -> Path:
     """Build (or reuse) a TRT engine for the given UNet. Returns engine path.
 
     The engine accepts dynamic spatial dims 256-1024 and batch min..max.
-    With use_control=True, ControlNet residuals are first-class engine
-    inputs (input_control_00..N) — pass zeros when controlnet is off.
+    Plain SD UNet only — does not handle ControlNet residuals. See the
+    module docstring.
     """
-    from streamdiffusion.acceleration.tensorrt.models.models import UNet
-    from streamdiffusion.acceleration.tensorrt.utilities import (
-        build_engine,
-        export_onnx,
-        optimize_onnx,
-    )
+    from ._trt import UNet, compile_unet, create_onnx_path
 
-    suffix = f"unet_b{min_batch_size}-{max_batch_size}_cn{int(use_control)}"
+    suffix = f"unet_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
     cache_dir = _model_cache_dir(model_id, suffix)
-    onnx_path = cache_dir / "unet.onnx"
-    onnx_opt_path = cache_dir / "unet_opt.onnx"
-    engine_path = cache_dir / "unet.plan"
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "unet.engine"
 
     if engine_path.exists():
         logger.info(f"[TRT] Reusing cached UNet engine: {engine_path}")
         return engine_path
 
-    logger.info(f"[TRT] Building UNet engine -> {engine_path} (this takes 5-10min)")
+    logger.info(f"[TRT] Building UNet engine -> {engine_path} (5-10 min on first build)")
 
-    # Read UNet architecture so the model_data spec matches the actual UNet.
-    unet_arch = {
-        "block_out_channels": tuple(unet.config.block_out_channels),
-        "cross_attention_dim": unet.config.cross_attention_dim,
-        "in_channels": unet.config.in_channels,
-    }
-
-    model_data = UNet(
-        unet=unet,
+    # The vendored UNet model class is plain SD — three inputs, one output,
+    # no IPAdapter / ControlNet leak. embedding_dim comes from the actual
+    # UNet config so SD1.5/2.1/SDXL all work.
+    unet_model = UNet(
         fp16=True,
-        device="cuda",
+        device=str(unet.device) if unet.device.type != "meta" else "cuda",
         max_batch_size=max_batch_size,
         min_batch_size=min_batch_size,
         embedding_dim=unet.config.cross_attention_dim,
-        text_maxlen=text_maxlen,
         unet_dim=unet.config.in_channels,
-        use_control=use_control,
-        unet_arch=unet_arch,
-        image_height=image_height,
-        image_width=image_width,
     )
-
-    if not onnx_opt_path.exists():
-        if not onnx_path.exists():
-            export_onnx(
-                unet,
-                str(onnx_path),
-                model_data,
-                opt_image_height=image_height,
-                opt_image_width=image_width,
-                opt_batch_size=min_batch_size,
-                onnx_opset=17,
-            )
-        optimize_onnx(
-            str(onnx_path),
-            str(onnx_opt_path),
-            model_data,
-        )
-
-    build_engine(
-        engine_path=str(engine_path),
-        onnx_opt_path=str(onnx_opt_path),
-        model_data=model_data,
-        opt_image_height=image_height,
-        opt_image_width=image_width,
+    compile_unet(
+        unet,
+        unet_model,
+        str(create_onnx_path("unet", str(onnx_dir), opt=False)),
+        str(create_onnx_path("unet", str(onnx_dir), opt=True)),
+        str(engine_path),
         opt_batch_size=min_batch_size,
-        build_static_batch=False,
-        build_dynamic_shape=True,
+        engine_build_options={
+            "build_dynamic_shape": True,
+            "build_static_batch": False,
+        },
     )
     logger.info(f"[TRT] UNet engine built: {engine_path}")
     return engine_path
 
 
-def build_controlnet_engine(
-    controlnet: ControlNetModel,
-    *,
-    model_id: str,
-    image_height: int = 512,
-    image_width: int = 512,
-    min_batch_size: int = 1,
-    max_batch_size: int = 4,
-    text_maxlen: int = 77,
-) -> Path:
-    """Build (or reuse) a TRT engine for a ControlNet. Returns engine path."""
-    from streamdiffusion.acceleration.tensorrt.models.controlnet_models import (
-        ControlNetWithEmbeds,
-    )
-    from streamdiffusion.acceleration.tensorrt.utilities import (
-        build_engine,
-        export_onnx,
-        optimize_onnx,
-    )
-
-    suffix = f"cn_b{min_batch_size}-{max_batch_size}"
-    cache_dir = _model_cache_dir(model_id, suffix)
-    onnx_path = cache_dir / "controlnet.onnx"
-    onnx_opt_path = cache_dir / "controlnet_opt.onnx"
-    engine_path = cache_dir / "controlnet.plan"
-
-    if engine_path.exists():
-        logger.info(f"[TRT] Reusing cached ControlNet engine: {engine_path}")
-        return engine_path
-
-    logger.info(f"[TRT] Building ControlNet engine -> {engine_path} (this takes 3-5min)")
-
-    model_data = ControlNetWithEmbeds(
-        controlnet=controlnet,
-        fp16=True,
-        device="cuda",
-        max_batch_size=max_batch_size,
-        min_batch_size=min_batch_size,
-        embedding_dim=controlnet.config.cross_attention_dim,
-        text_maxlen=text_maxlen,
-        image_height=image_height,
-        image_width=image_width,
-    )
-
-    if not onnx_opt_path.exists():
-        if not onnx_path.exists():
-            export_onnx(
-                controlnet,
-                str(onnx_path),
-                model_data,
-                opt_image_height=image_height,
-                opt_image_width=image_width,
-                opt_batch_size=min_batch_size,
-                onnx_opset=17,
-            )
-        optimize_onnx(
-            str(onnx_path),
-            str(onnx_opt_path),
-            model_data,
-        )
-
-    build_engine(
-        engine_path=str(engine_path),
-        onnx_opt_path=str(onnx_opt_path),
-        model_data=model_data,
-        opt_image_height=image_height,
-        opt_image_width=image_width,
-        opt_batch_size=min_batch_size,
-        build_static_batch=False,
-        build_dynamic_shape=True,
-    )
-    logger.info(f"[TRT] ControlNet engine built: {engine_path}")
-    return engine_path
-
-
-# ─── Drop-in adapters ───────────────────────────────────────────────────────
-
-
 class TRTUNetAdapter:
-    """Wraps UNet2DConditionModelEngine to mimic diffusers UNet2DConditionModel.
+    """Thin wrapper for the vendored UNet engine.
 
-    Existing pipeline.py calls:
+    Existing `pipeline.py._unet_step` calls:
+
         model_pred = self.unet(
-            x_t_latent, t_list,
+            x_t_latent_plus_uc, t_list,
             encoder_hidden_states=embeds,
             added_cond_kwargs=...,
             down_block_additional_residuals=...,
@@ -229,32 +124,27 @@ class TRTUNetAdapter:
             return_dict=False,
         )[0]
 
-    We accept the same signature and return (sample,).
+    The vendored engine __call__ returns `UNet2DConditionOutput(sample=...)`
+    and ignores everything beyond (sample, timestep, encoder_hidden_states).
+    We adapt to support both `return_dict=False` (tuple) and the default
+    (UNet2DConditionOutput).
     """
 
-    def __init__(self, engine_path: Path, cuda_stream, *, use_control: bool):
-        from streamdiffusion.acceleration.tensorrt.runtime_engines import (
-            UNet2DConditionModelEngine,
-        )
+    def __init__(self, engine_path: Path, cuda_stream):
+        from ._trt import UNet2DConditionModelEngine
         self.engine = UNet2DConditionModelEngine(str(engine_path), cuda_stream)
-        self.engine.use_control = use_control
-        self.use_control = use_control
-        # Mimic the surface our pipeline reads off the diffusers UNet
+        # Surface that pipeline.py reads
         self.config = _ConfigShim()
-        self.add_embedding = None  # SD2.1 doesn't have add_embedding; SDXL would
+        self.add_embedding = None  # SD2.1: no add_embedding (SDXL would)
 
     def __call__(
         self,
         sample: torch.Tensor,
         timestep,
         encoder_hidden_states: torch.Tensor,
-        added_cond_kwargs: Optional[dict] = None,
-        down_block_additional_residuals=None,
-        mid_block_additional_residual=None,
         return_dict: bool = True,
         **kwargs,
     ):
-        # Engine wants timestep as a tensor; pipeline.py passes a list/tensor.
         if not isinstance(timestep, torch.Tensor):
             timestep = torch.tensor(timestep, device=sample.device)
         if timestep.ndim == 0:
@@ -264,82 +154,22 @@ class TRTUNetAdapter:
             latent_model_input=sample,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
-            kvo_cache=[],
-            down_block_additional_residuals=down_block_additional_residuals,
-            mid_block_additional_residual=mid_block_additional_residual,
         )
-
-        # Engine returns either a tensor or a UNet2DConditionOutput-like object.
-        if hasattr(out, "sample"):
-            sample_out = out.sample
-        elif isinstance(out, (tuple, list)):
-            sample_out = out[0]
-        else:
-            sample_out = out
-
+        # out is UNet2DConditionOutput
         if return_dict:
-            from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
-            return UNet2DConditionOutput(sample=sample_out)
-        return (sample_out,)
+            return out
+        return (out.sample,)
 
+    # diffusers Module surface — pipeline.py never calls these in practice
+    def to(self, *args, **kwargs):
+        return self
 
-class TRTControlNetAdapter:
-    """Wraps ControlNetModelEngine to mimic diffusers ControlNetModel.
-
-    Existing pipeline.py calls:
-        down_block_res_samples, mid_block_res_sample = self.controlnet(
-            x_t_latent_plus_uc, t_list,
-            encoder_hidden_states=...,
-            controlnet_cond=cond_image,
-            conditioning_scale=...,
-            return_dict=False,
-        )
-    """
-
-    def __init__(self, engine_path: Path, cuda_stream):
-        from streamdiffusion.acceleration.tensorrt.runtime_engines import (
-            ControlNetModelEngine,
-        )
-        self.engine = ControlNetModelEngine(str(engine_path), cuda_stream)
-        self.config = _ConfigShim()
-
-    def __call__(
-        self,
-        sample: torch.Tensor,
-        timestep,
-        encoder_hidden_states: torch.Tensor,
-        controlnet_cond: torch.Tensor,
-        conditioning_scale: float = 1.0,
-        return_dict: bool = True,
-        **kwargs,
-    ):
-        if not isinstance(timestep, torch.Tensor):
-            timestep = torch.tensor(timestep, device=sample.device)
-        if timestep.ndim == 0:
-            timestep = timestep.unsqueeze(0)
-
-        out = self.engine(
-            sample=sample,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            controlnet_cond=controlnet_cond,
-            conditioning_scale=torch.tensor([conditioning_scale], device=sample.device),
-        )
-        # out is a tuple (down_block_res_samples_list, mid_block_res_sample)
-        if isinstance(out, (list, tuple)) and len(out) == 2:
-            down_block_res_samples, mid_block_res_sample = out
-            if return_dict:
-                from diffusers.models.controlnets.controlnet import ControlNetOutput
-                return ControlNetOutput(
-                    down_block_res_samples=down_block_res_samples,
-                    mid_block_res_sample=mid_block_res_sample,
-                )
-            return (down_block_res_samples, mid_block_res_sample)
-        raise RuntimeError(f"Unexpected ControlNet engine output shape: {type(out)}")
+    def eval(self):
+        return self
 
 
 class _ConfigShim:
-    """Diffusers config object surface — pipeline.py reads addition_time_embed_dim, etc."""
+    """Diffusers config object surface — read by pipeline._prepare_runtime_state."""
 
     def __init__(self):
         self.addition_time_embed_dim = None
@@ -348,10 +178,7 @@ class _ConfigShim:
         self.cross_attention_dim = 1024
 
 
-# ─── CUDA stream helper ─────────────────────────────────────────────────────
-
-
 def make_cuda_stream():
-    """Polygraphy CUDA stream wrapper used by both engine classes."""
+    """Polygraphy CUDA stream wrapper used by the engine classes."""
     from polygraphy import cuda
     return cuda.Stream()
