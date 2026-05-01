@@ -68,7 +68,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     acceleration_mode: Literal["none", "trt"] = Field(
-        default="none",
+        default="trt",
         description=(
             "TRT-compile UNet (and ControlNet) for ~2-3x denoising speedup. "
             "First build per (model, batch range) takes 5-10 min and caches to "
@@ -315,19 +315,21 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=57, label="Mask Strength"),
     )
 
-    # Resolution settings (can be overridden at runtime)
-    width: int = Field(
+    # Resolution settings — must be a multiple of 64 (UNet downsamples latents
+    # 3x; ControlNet residuals go to /8 in latent space, so pixel dim has to
+    # divide by 64). TRT engines are built for the 256-1024 dynamic range.
+    width: Literal[
+        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    ] = Field(
         default=512,
-        ge=128,
-        le=2048,
-        description="Output width",
-        # json_schema_extra=ui_field_config(order=60, label="Width"),
+        description="Output width (multiple of 64, 256-1024)",
+        json_schema_extra=ui_field_config(order=60, label="Width"),
     )
 
-    height: int = Field(
+    height: Literal[
+        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    ] = Field(
         default=512,
-        ge=128,
-        le=2048,
-        description="Output height",
-        # json_schema_extra=ui_field_config(order=61, label="Height"),
+        description="Output height (multiple of 64, 256-1024)",
+        json_schema_extra=ui_field_config(order=61, label="Height"),
     )
