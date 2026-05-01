@@ -198,8 +198,13 @@ class ControlNetHandler:
                     .repeat(1, 3, 1, 1)
                 )
 
-                # Output blending — catches residual pixel-level flicker after bounds stabilization
-                if self._prev_depth_input is not None and temporal_smoothing < 1.0:
+                # Output blending — catches residual pixel-level flicker after bounds stabilization.
+                # Drop the prev buffer if the resolution changed (live width/height swap).
+                if (
+                    self._prev_depth_input is not None
+                    and self._prev_depth_input.shape == self.input.shape
+                    and temporal_smoothing < 1.0
+                ):
                     self.input = (
                         temporal_smoothing * self.input
                         + (1 - temporal_smoothing) * self._prev_depth_input
@@ -280,7 +285,11 @@ class ControlNetHandler:
             # (1, 1, H, W) -> (1, 3, H, W)
             self.input = scribble.to(dtype=self.dtype).repeat(1, 3, 1, 1)
 
-            if self._prev_scribble_input is not None and temporal_smoothing < 1.0:
+            if (
+                self._prev_scribble_input is not None
+                and self._prev_scribble_input.shape == self.input.shape
+                and temporal_smoothing < 1.0
+            ):
                 self.input = (
                     temporal_smoothing * self.input
                     + (1 - temporal_smoothing) * self._prev_scribble_input
