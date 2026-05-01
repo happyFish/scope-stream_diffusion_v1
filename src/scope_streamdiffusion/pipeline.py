@@ -98,6 +98,10 @@ class StreamDiffusionPipeline(Pipeline):
         self._unet_compiled: bool = False
         self._compiled_controlnet_ids: set[int] = set()
 
+        # TAESD TRT state
+        self._trt_taesd_built: bool = False
+        self._trt_eager_taesd = None
+
         # TRT engine state — set once on first call when acceleration_mode='trt'.
         # self.unet is swapped to a TRT UNet adapter; self.controlnet (when
         # controlnet_mode != 'none') is independently swapped to a TRT
@@ -193,6 +197,56 @@ class StreamDiffusionPipeline(Pipeline):
         self._last_mode: str | None = None
 
         print("StreamDiffusion pipeline initialized")
+
+    def _ensure_trt_taesd(self) -> None:
+        """Build TRT engines for the TAESD encoder + decoder, swap self.vae.
+
+        Called only when use_taesd is on AND acceleration_mode='trt'.
+        TAESD is small so engine builds are fast (~30-60s per engine on
+        first run). One-shot per process; cached engines load instantly.
+        """
+        if self._trt_taesd_built:
+            return
+        if self._taesd_vae is None:
+            return
+        self._trt_taesd_built = True  # prevent retry on failure
+
+        from .trt_engines import (
+            TRTTaesdAdapter,
+            build_taesd_engines,
+            make_cuda_stream,
+        )
+        if self._trt_cuda_stream is None:
+            self._trt_cuda_stream = make_cuda_stream()
+        print(
+            "[TRT] Preparing TAESD engines — first build takes ~1 min, cached after",
+            flush=True,
+        )
+        try:
+            enc_path, dec_path = build_taesd_engines(
+                self._taesd_vae,
+                model_id="madebyollin/taesd",
+                image_height=int(self.height),
+                image_width=int(self.width),
+                min_batch_size=1,
+                max_batch_size=4,
+            )
+        except Exception as e:
+            print(f"[TRT] TAESD engine build failed, using eager: {e}")
+            return
+        scaling_factor = float(self._taesd_vae.config.scaling_factor)
+        vae_scale_factor = self.pipe.vae_scale_factor
+        adapter = TRTTaesdAdapter(
+            enc_path, dec_path, self._trt_cuda_stream,
+            scaling_factor=scaling_factor,
+            vae_scale_factor=vae_scale_factor,
+            dtype=self.dtype,
+        )
+        self._trt_eager_taesd = self._taesd_vae
+        self._taesd_vae = adapter
+        if self._using_taesd:
+            self.vae = adapter
+        print(f"[TRT] TAESD engines active: enc={enc_path.name}, dec={dec_path.name}", flush=True)
 
     def _ensure_trt_controlnet(self, mode: str) -> None:
         """Build (or reuse) TRT engine for the active ControlNet, swap self.controlnet.
@@ -1356,6 +1410,14 @@ class StreamDiffusionPipeline(Pipeline):
                     self._ensure_trt_controlnet(controlnet_mode)
                 except Exception as e:
                     print(f"[TRT] ControlNet engine swap failed for {controlnet_mode}, using eager: {e}")
+                    import traceback
+                    traceback.print_exc()
+            # TAESD TRT — saves ~3-5 ms vs eager TAESD (which is already fast)
+            if use_taesd:
+                try:
+                    self._ensure_trt_taesd()
+                except Exception as e:
+                    print(f"[TRT] TAESD engine swap failed, using eager: {e}")
                     import traceback
                     traceback.print_exc()
 

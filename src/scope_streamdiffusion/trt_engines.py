@@ -568,6 +568,135 @@ class _ConfigShim:
         self.cross_attention_dim = 1024
 
 
+def build_taesd_engines(
+    taesd_vae,  # diffusers AutoencoderTiny instance
+    *,
+    model_id: str = "madebyollin/taesd",
+    image_height: int = 512,
+    image_width: int = 512,
+    min_batch_size: int = 1,
+    max_batch_size: int = 4,
+) -> tuple[Path, Path]:
+    """Build (or reuse) TRT engines for TAESD encoder + decoder.
+
+    TAESD is small (~10 MB each), so engine builds are fast (30-60s each
+    on first run). The encoder and decoder are independent — separate
+    engines, separate cache entries.
+    """
+    from ._trt import (
+        VAE,
+        VAEEncoder,
+        compile_vae_decoder,
+        compile_vae_encoder,
+        create_onnx_path,
+        TorchVAEEncoder,
+    )
+
+    suffix = f"taesd_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
+    cache_dir = _model_cache_dir(model_id, suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    encoder_engine_path = cache_dir / "taesd_encoder.engine"
+    decoder_engine_path = cache_dir / "taesd_decoder.engine"
+
+    # Encoder
+    if not encoder_engine_path.exists():
+        logger.info(f"[TRT] Building TAESD encoder -> {encoder_engine_path}")
+        # The prism TorchVAEEncoder runs retrieve_latents over .encode(); for
+        # TAESD that returns AutoencoderTinyOutput(latents=...).
+        wrapped_encoder = TorchVAEEncoder(taesd_vae).to(torch.device("cuda")).eval()
+        encoder_model = VAEEncoder(
+            device="cuda", max_batch_size=max_batch_size, min_batch_size=min_batch_size,
+        )
+        compile_vae_encoder(
+            wrapped_encoder, encoder_model,
+            str(create_onnx_path("taesd_encoder", str(onnx_dir), opt=False)),
+            str(create_onnx_path("taesd_encoder", str(onnx_dir), opt=True)),
+            str(encoder_engine_path),
+            opt_batch_size=min_batch_size,
+            engine_build_options={"build_dynamic_shape": True, "build_static_batch": False},
+        )
+    else:
+        logger.info(f"[TRT] Reusing cached TAESD encoder: {encoder_engine_path}")
+
+    # Decoder — set vae.forward = vae.decode for export, undo after
+    if not decoder_engine_path.exists():
+        logger.info(f"[TRT] Building TAESD decoder -> {decoder_engine_path}")
+        # Prism's pattern: replace .forward with .decode for export only.
+        # Note that AutoencoderTiny.decode returns DecoderOutput(sample=...);
+        # the prism path expects forward to return the tensor, so we need a
+        # thin wrapper that unwraps the DecoderOutput.
+        class _DecoderWrap(torch.nn.Module):
+            def __init__(self, vae):
+                super().__init__()
+                self.vae = vae
+            def forward(self, latent):
+                return self.vae.decode(latent, return_dict=False)[0]
+        wrapped_decoder = _DecoderWrap(taesd_vae).to(torch.device("cuda")).eval()
+        decoder_model = VAE(
+            device="cuda", max_batch_size=max_batch_size, min_batch_size=min_batch_size,
+        )
+        compile_vae_decoder(
+            wrapped_decoder, decoder_model,
+            str(create_onnx_path("taesd_decoder", str(onnx_dir), opt=False)),
+            str(create_onnx_path("taesd_decoder", str(onnx_dir), opt=True)),
+            str(decoder_engine_path),
+            opt_batch_size=min_batch_size,
+            engine_build_options={"build_dynamic_shape": True, "build_static_batch": False},
+        )
+    else:
+        logger.info(f"[TRT] Reusing cached TAESD decoder: {decoder_engine_path}")
+
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    return encoder_engine_path, decoder_engine_path
+
+
+class TRTTaesdAdapter:
+    """Drop-in for diffusers AutoencoderTiny.
+
+    Pipeline.py calls ``self.vae.encode(x)`` (expects ``.latents``) and
+    ``self.vae.decode(x, return_dict=False)`` (expects ``(sample,)``).
+    Reuses prism's AutoencoderKLEngine — its encode returns
+    AutoencoderTinyOutput(latents=...) and decode returns
+    DecoderOutput(sample=...), matching what AutoencoderTiny does.
+    """
+
+    class _Config:
+        def __init__(self, scaling_factor: float):
+            self.scaling_factor = scaling_factor
+
+    def __init__(
+        self,
+        encoder_path: Path,
+        decoder_path: Path,
+        cuda_stream,
+        scaling_factor: float = 1.0,
+        vae_scale_factor: int = 8,
+        dtype: torch.dtype = torch.float16,
+    ):
+        from ._trt import AutoencoderKLEngine
+        self._engine = AutoencoderKLEngine(
+            str(encoder_path), str(decoder_path), cuda_stream,
+            scaling_factor=vae_scale_factor,
+        )
+        self.config = self._Config(scaling_factor)
+        self.dtype = dtype
+
+    def encode(self, image_tensors: torch.Tensor, **kwargs):
+        return self._engine.encode(image_tensors)
+
+    def decode(self, latent: torch.Tensor, return_dict: bool = True, **kwargs):
+        out = self._engine.decode(latent)
+        if return_dict:
+            return out
+        return (out.sample,)
+
+    def to(self, *args, **kwargs):
+        return self
+
+
 def make_cuda_stream():
     """Polygraphy CUDA stream wrapper used by the engine classes."""
     from polygraphy import cuda
