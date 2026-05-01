@@ -11,6 +11,22 @@ dependencies = [
     "pillow",
 ]
 
+# xformers gives ~2x on attention but ships per-torch-version wheels with
+# strict (and often wrong) torch pins in the wheel metadata. Adding it to
+# `dependencies` makes uv force-upgrade or downgrade torch during install,
+# which breaks the rest of Scope's GPU stack (flash-attn ABI, CUDA, etc).
+#
+# Install manually after the plugin is set up, picking the version that
+# matches Scope's host torch:
+#
+#   torch 2.9.x  →  uv pip install --no-deps xformers==0.0.33.post2
+#   torch 2.10.x →  uv pip install --no-deps xformers==0.0.34
+#
+# `--no-deps` is required to skip xformers' bogus torch pin.
+[project.optional-dependencies]
+accel-torch29 = ["xformers==0.0.33.post2"]
+accel-torch210 = ["xformers==0.0.34"]
+
 [project.entry-points."scope"]
 scope_streamdiffusion = "scope_streamdiffusion"
 

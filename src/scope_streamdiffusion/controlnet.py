@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from typing import Optional
 
 import numpy as np
@@ -30,6 +31,10 @@ _DEPTH_MODEL_CONFIG = {
 }
 _DEPTH_CHECKPOINT = "Video-Depth-Anything-Small/video_depth_anything_vits.pth"
 
+# ImageNet normalization constants used by VideoDepthAnything's preprocessing.
+_DEPTH_MEAN = (0.485, 0.456, 0.406)
+_DEPTH_STD = (0.229, 0.224, 0.225)
+
 
 class ControlNetHandler:
     """Manages ControlNet models and frame preprocessing for StreamDiffusion.
@@ -48,7 +53,9 @@ class ControlNetHandler:
         self.dtype = dtype
         self._controlnet_cache: dict[str, ControlNetModel] = {}
         self._depth_model = None
+        self._depth_compiled: bool = False
         self._depth_hidden_state = None
+        self._last_depth_shape: tuple[int, int] | None = None
         self._depth_min_ema: float | None = None
         self._depth_max_ema: float | None = None
         self._prev_depth_input: torch.Tensor | None = None
@@ -58,6 +65,22 @@ class ControlNetHandler:
         # Depth frame-skipping: reuse cached depth every N frames to save 20-40ms/frame
         self._depth_frame_counter: int = 0
         self._depth_skip_interval: int = 3  # run depth every Nth frame
+        self._depth_input_size: int = 518
+        self._use_depth_temporal_cache: bool = True
+
+        # FPS telemetry for the depth path. Logged ~every 2s so the cost of
+        # different input sizes / cache settings is visible without flooding stdout.
+        self._depth_log_interval_s: float = 2.0
+        self._depth_log_last_time: float = time.monotonic()
+        self._depth_log_calls: int = 0   # depth-model invocations since last log
+        self._depth_log_skips: int = 0   # cached-reuse frames since last log
+        self._depth_log_total_ms: float = 0.0  # sum of per-call durations
+
+        # Lazy-built GPU normalization tensors — created on first depth call so
+        # they live on the right device. Shape (1, 1, 3, 1, 1) to broadcast
+        # against the (B, T, C, H, W) model input.
+        self._depth_norm_mean: torch.Tensor | None = None
+        self._depth_norm_std: torch.Tensor | None = None
 
         self.model: Optional[ControlNetModel] = None
         self.input: Optional[torch.Tensor] = None
@@ -75,6 +98,9 @@ class ControlNetHandler:
         depth_min: float = 0,
         depth_max: float = 12,
         depth_skip_interval: int = 3,
+        depth_input_size: int = 518,
+        depth_temporal_cache: bool = True,
+        depth_compile: bool = False,
     ) -> None:
         """Update ControlNet state for the current frame.
 
@@ -92,6 +118,19 @@ class ControlNetHandler:
         self.input = None
         self.scale = scale
         self._depth_skip_interval = max(1, depth_skip_interval)
+
+        # Depth model running params
+        new_input_size = max(14, (int(depth_input_size) // 14) * 14)
+        if new_input_size != self._depth_input_size:
+            # Patch grid will change — drop the temporal cache to avoid the
+            # same shape mismatch we guard against on resolution changes.
+            self._depth_hidden_state = None
+            self._last_depth_shape = None
+            self._depth_input_size = new_input_size
+        if bool(depth_temporal_cache) != self._use_depth_temporal_cache:
+            self._depth_hidden_state = None
+            self._use_depth_temporal_cache = bool(depth_temporal_cache)
+        self._depth_compile_requested = bool(depth_compile)
 
         if mode == "depth" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("depth")
@@ -113,7 +152,14 @@ class ControlNetHandler:
             if run_depth:
                 self._depth_frame_counter = 0
 
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
                 depth_t = self._run_depth_inference(video[0])
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                self._depth_log_total_ms += (time.perf_counter() - t0) * 1000.0
+                self._depth_log_calls += 1
 
                 # EMA on normalization bounds — prevents scale/contrast jumps between frames
                 d_min, d_max = float(depth_t.min()), float(depth_t.max())
@@ -162,6 +208,38 @@ class ControlNetHandler:
             else:
                 # Reuse cached depth from previous key frame
                 self.input = self._prev_depth_input
+                self._depth_log_skips += 1
+
+            # Periodic FPS log for the depth path. Reports model FPS (only the
+            # frames where depth actually ran) and effective FPS (counting the
+            # skipped/reused frames). Helps tune input_size / skip_interval.
+            now = time.monotonic()
+            elapsed = now - self._depth_log_last_time
+            if elapsed >= self._depth_log_interval_s and (
+                self._depth_log_calls + self._depth_log_skips
+            ) > 0:
+                model_fps = self._depth_log_calls / elapsed
+                eff_fps = (
+                    self._depth_log_calls + self._depth_log_skips
+                ) / elapsed
+                avg_ms = (
+                    self._depth_log_total_ms / self._depth_log_calls
+                    if self._depth_log_calls
+                    else 0.0
+                )
+                print(
+                    f"[Depth] model={model_fps:.1f} fps ({avg_ms:.1f} ms/call), "
+                    f"effective={eff_fps:.1f} fps "
+                    f"(calls={self._depth_log_calls}, "
+                    f"reused={self._depth_log_skips}, "
+                    f"size={self._depth_input_size}, "
+                    f"cache={'on' if self._use_depth_temporal_cache else 'off'})",
+                    flush=True,
+                )
+                self._depth_log_last_time = now
+                self._depth_log_calls = 0
+                self._depth_log_skips = 0
+                self._depth_log_total_ms = 0.0
 
         elif mode == "scribble" and video is not None and len(video) > 0:
             self.model = self._get_model_for_mode("scribble")
@@ -235,14 +313,92 @@ class ControlNetHandler:
             )
             self._depth_model = model.to(device=self.device).half().eval()
             print("[Depth] Model loaded")
+
+        # One-shot torch.compile when the param is enabled. Compile the bound
+        # forward method (not the whole Module) so both call paths see the
+        # compiled graph uniformly:
+        #   * Legacy: `model.infer_video_depth_one` calls `self.forward(...)`
+        #   * Direct: `model(x, ...)` -> Module.__call__ -> forward(...)
+        # Wrapping the whole module via `torch.compile(model)` puts an
+        # OptimizedModule between the two and triggers FX/dynamo conflicts when
+        # called via __call__.
+        if (
+            getattr(self, "_depth_compile_requested", False)
+            and not self._depth_compiled
+        ):
+            try:
+                self._depth_model.forward = torch.compile(  # type: ignore[method-assign]
+                    self._depth_model.forward,
+                    mode="reduce-overhead",
+                    dynamic=True,
+                    fullgraph=False,
+                )
+                self._depth_compiled = True
+                print("[Depth] torch.compile enabled (first call will be slow)")
+            except Exception as e:
+                # Compilation is best-effort — fall back to eager on failure.
+                print(f"[Depth] torch.compile failed, using eager: {e}")
+                self._depth_compiled = True  # don't retry every call
         return self._depth_model
+
+    def _run_depth_inference_direct(
+        self, frame_t: torch.Tensor, input_size: int, cache_in
+    ) -> tuple[torch.Tensor, object]:
+        """GPU-native depth path that bypasses Scope's CPU-roundtrip wrappers.
+
+        Calls model.forward directly with a square (input_size, input_size) tensor
+        already on the GPU — no PIL.Resize, no numpy hop. Returns depth at the
+        model's input resolution; caller upsamples to controlnet H/W.
+
+        Args:
+            frame_t: (H, W, C) tensor on self.device, uint8 [0,255] or float [0,1].
+            input_size: Square model input size (must be multiple of 14).
+            cache_in: Cached hidden states from previous frame, or None.
+
+        Returns:
+            (depth_t, new_cache): depth at (input_size, input_size), and the
+            updated hidden-state list.
+        """
+        # Build (and cache) the broadcastable mean/std on first use.
+        if self._depth_norm_mean is None or self._depth_norm_mean.device != self.device:
+            self._depth_norm_mean = torch.tensor(
+                _DEPTH_MEAN, device=self.device, dtype=torch.float16
+            ).view(1, 1, 3, 1, 1)
+            self._depth_norm_std = torch.tensor(
+                _DEPTH_STD, device=self.device, dtype=torch.float16
+            ).view(1, 1, 3, 1, 1)
+
+        # Move to GPU and convert dtype in one shot. video_playlist may emit
+        # frames on CPU (its own device defaults to cpu), so we can't assume
+        # the input is already on self.device.
+        if frame_t.dtype == torch.uint8:
+            x = frame_t.to(device=self.device, dtype=torch.float16) / 255.0
+        else:
+            x = frame_t.to(device=self.device, dtype=torch.float16).clamp(0.0, 1.0)
+
+        # (H, W, C) -> (1, 1, C, H, W) and resize to (input_size, input_size).
+        # Square resize is intentional: the depth map gets bilinear-upsampled to
+        # controlnet H/W downstream anyway, so aspect-preservation buys nothing
+        # for conditioning and a fixed shape avoids motion-cache invalidation.
+        x = x.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)  # (1, 1, C, H, W)
+        x_btchw = x.flatten(0, 1)  # (1, C, H, W) for interpolate
+        x_btchw = F.interpolate(
+            x_btchw, size=(input_size, input_size), mode="bilinear", align_corners=False
+        )
+        x = x_btchw.unsqueeze(1)  # (1, 1, C, H, W)
+        x = (x - self._depth_norm_mean) / self._depth_norm_std
+
+        # forward returns depth (B, T, H, W) and hidden states.
+        depth, new_cache = self._depth_model(x, cached_hidden_state_list=cache_in)
+        # depth: (1, 1, H, W) — squeeze to (H, W), float32 for downstream EMA math.
+        depth_t = depth.squeeze(0).squeeze(0).to(torch.float32)
+        return depth_t, new_cache
 
     def _run_depth_inference(self, frame: torch.Tensor) -> torch.Tensor:
         """Run depth inference on a single frame, preferring the GPU-native path.
 
-        Tries infer_depth_tensor() first (zero CPU roundtrips). Falls back to the
-        legacy infer_video_depth_one() with return_tensor=True, and finally to the
-        numpy path if neither is available.
+        Order of preference: infer_depth_tensor() (Scope shim, if present),
+        our own direct GPU forward, then the legacy CPU-roundtrip path.
 
         Args:
             frame: (T, H, W, C) or (H, W, C) tensor from the video input.
@@ -253,6 +409,15 @@ class ControlNetHandler:
         global _HAS_GPU_DEPTH
 
         frame_t = frame.squeeze(0)  # (H, W, C)
+
+        # Drop stale temporal cache when input resolution/aspect changes — the
+        # depth model's patch grid is shape-dependent, so a cache from a square
+        # clip can't be concatenated with a widescreen frame's hidden state.
+        shape_key = (int(frame_t.shape[0]), int(frame_t.shape[1]))
+        if shape_key != self._last_depth_shape:
+            self._depth_hidden_state = None
+            self._last_depth_shape = shape_key
+
         depth_model = self._get_depth_preprocessor()
         device_str = "cuda" if self.device.type == "cuda" else "cpu"
 
@@ -262,7 +427,18 @@ class ControlNetHandler:
             if _HAS_GPU_DEPTH:
                 print("[Depth] Using GPU-native infer_depth_tensor() path")
             else:
-                print("[Depth] GPU-native path not available, using legacy path")
+                print("[Depth] Using direct-GPU path (bypassing legacy CPU roundtrip)")
+
+        cache_in = self._depth_hidden_state if self._use_depth_temporal_cache else None
+        input_size = self._depth_input_size
+
+        if not _HAS_GPU_DEPTH and self.device.type == "cuda":
+            # Direct GPU forward — same model, no PIL/numpy detour.
+            depth_t, new_cache = self._run_depth_inference_direct(
+                frame_t, input_size, cache_in
+            )
+            self._depth_hidden_state = new_cache if self._use_depth_temporal_cache else None
+            return depth_t
 
         if _HAS_GPU_DEPTH:
             # GPU-native path: keep everything on GPU
@@ -275,12 +451,13 @@ class ControlNetHandler:
                 device=self.device, dtype=torch.float32
             ).permute(2, 0, 1).unsqueeze(0)
 
-            depth_t, self._depth_hidden_state = depth_model.infer_depth_tensor(
+            depth_t, new_cache = depth_model.infer_depth_tensor(
                 frame_bchw,
-                input_size=518,
+                input_size=input_size,
                 fp32=False,
-                cached_hidden_state_list=self._depth_hidden_state,
+                cached_hidden_state_list=cache_in,
             )
+            self._depth_hidden_state = new_cache if self._use_depth_temporal_cache else None
             return depth_t  # (H, W) on GPU
         else:
             # Legacy path: CPU roundtrip via numpy
@@ -293,27 +470,29 @@ class ControlNetHandler:
 
             # Try return_tensor=True first (available with updated Scope)
             try:
-                depth_t, self._depth_hidden_state = depth_model.infer_video_depth_one(
+                depth_t, new_cache = depth_model.infer_video_depth_one(
                     frame_np,
-                    input_size=518,
+                    input_size=input_size,
                     device=device_str,
                     fp32=False,
-                    cached_hidden_state_list=self._depth_hidden_state,
+                    cached_hidden_state_list=cache_in,
                     return_tensor=True,
                 )
+                self._depth_hidden_state = new_cache if self._use_depth_temporal_cache else None
                 if isinstance(depth_t, torch.Tensor):
                     return depth_t.to(device=self.device, dtype=torch.float32)
             except TypeError:
                 pass
 
             # Oldest path: numpy roundtrip
-            depth_np, self._depth_hidden_state = depth_model.infer_video_depth_one(
+            depth_np, new_cache = depth_model.infer_video_depth_one(
                 frame_np,
-                input_size=518,
+                input_size=input_size,
                 device=device_str,
                 fp32=False,
-                cached_hidden_state_list=self._depth_hidden_state,
+                cached_hidden_state_list=cache_in,
             )
+            self._depth_hidden_state = new_cache if self._use_depth_temporal_cache else None
             return torch.from_numpy(depth_np).to(
                 device=self.device, dtype=torch.float32
             )

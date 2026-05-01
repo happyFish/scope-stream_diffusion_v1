@@ -73,6 +73,16 @@ class StreamDiffusionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
     )
 
+    compile_unet: bool = Field(
+        default=False,
+        description=(
+            "torch.compile the UNet (and ControlNet, if active) for ~30–50% "
+            "speedup on the denoising step. First run after enabling stalls "
+            "15–30s while compiling. Stays compiled until the pipeline reloads."
+        ),
+        json_schema_extra=ui_field_config(order=2, label="Compile UNet"),
+    )
+
     controlnet_mode: Literal["none", "depth", "scribble"] = Field(
         default="none",
         description="ControlNet conditioning mode. 'depth' runs Video Depth Anything internally and routes the depth map to ControlNet. First switch to a new mode stalls while the model loads.",
@@ -109,6 +119,24 @@ class StreamDiffusionConfig(BasePipelineConfig):
         le=10,
         description="Run depth model every Nth frame; reuse cached depth map on intermediate frames. Higher = less GPU cost, more temporal lag.",
         json_schema_extra=ui_field_config(order=7, label="Depth Skip Interval"),
+    )
+
+    depth_input_size: Literal[252, 364, 518] = Field(
+        default=518,
+        description="Resolution the depth model runs at (must be multiple of 14). Lower = faster but coarser depth. 252 ≈ 4× faster than 518; the depth map is bilinear-upsampled to controlnet resolution either way.",
+        json_schema_extra=ui_field_config(order=8, label="Depth Input Size"),
+    )
+
+    depth_temporal_cache: bool = Field(
+        default=True,
+        description="Use the video model's temporal hidden-state cache for inter-frame consistency. Disabling skips the temporal motion modules entirely (faster, slightly more flicker). Combined with skip interval > 1 the cache buys little, so toggle off for speed.",
+        json_schema_extra=ui_field_config(order=9, label="Depth Temporal Cache"),
+    )
+
+    depth_compile: bool = Field(
+        default=False,
+        description="torch.compile the depth model on first use. First call after enabling stalls 10–30s while compiling; subsequent calls are 15–30% faster. Stays compiled until the pipeline reloads.",
+        json_schema_extra=ui_field_config(order=10, label="Depth torch.compile"),
     )
 
     controlnet_temporal_smoothing: float = Field(

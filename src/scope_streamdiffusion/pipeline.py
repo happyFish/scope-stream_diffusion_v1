@@ -91,6 +91,12 @@ class StreamDiffusionPipeline(Pipeline):
         self._taesd_vae = None
         self._using_taesd = False
 
+        # torch.compile state — set once when `compile_unet` is first observed True.
+        # We compile the bound forward methods (not the modules themselves) so
+        # diffusers' Module.__call__ path stays clean and we can swap controlnets.
+        self._unet_compiled: bool = False
+        self._compiled_controlnet_ids: set[int] = set()
+
         # Check if SDXL
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
 
@@ -298,9 +304,6 @@ class StreamDiffusionPipeline(Pipeline):
         # --- Timestep schedule: only recompute when schedule params change ---
         schedule_key = (num_inference_steps, strength, tuple(t_index_list))
         if schedule_key != self._schedule_key:
-            print(
-                f"Using t_index_list: {t_index_list} from {num_inference_steps} total steps"
-            )
             self._set_timesteps(num_inference_steps, strength)
             self._schedule_key = schedule_key
 
@@ -1106,7 +1109,11 @@ class StreamDiffusionPipeline(Pipeline):
         depth_min = get_param("depth_min", 0)
         depth_max = get_param("depth_max", 12)
         depth_skip_interval = get_param("depth_skip_interval", 3)
+        depth_input_size = get_param("depth_input_size", 518)
+        depth_temporal_cache = get_param("depth_temporal_cache", True)
+        depth_compile = get_param("depth_compile", False)
         use_taesd = get_param("use_taesd", False)
+        compile_unet = get_param("compile_unet", False)
 
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
         # LCM scheduler requires: floor(original_steps * strength) >= num_inference_steps
@@ -1140,9 +1147,44 @@ class StreamDiffusionPipeline(Pipeline):
             depth_min=depth_min,
             depth_max=depth_max,
             depth_skip_interval=depth_skip_interval,
+            depth_input_size=depth_input_size,
+            depth_temporal_cache=depth_temporal_cache,
+            depth_compile=depth_compile,
         )
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
+
+        # torch.compile UNet (and current ControlNet) on first observed True.
+        # Compile the bound forward methods so diffusers' Module.__call__ path
+        # is unchanged and module hooks/repr still work.
+        if compile_unet:
+            if not self._unet_compiled:
+                try:
+                    self.unet.forward = torch.compile(  # type: ignore[method-assign]
+                        self.unet.forward,
+                        mode="reduce-overhead",
+                        dynamic=True,
+                        fullgraph=False,
+                    )
+                    self._unet_compiled = True
+                    print("[StreamDiffusion] torch.compile enabled on UNet (first call will be slow)")
+                except Exception as e:
+                    print(f"[StreamDiffusion] UNet compile failed, using eager: {e}")
+                    self._unet_compiled = True  # don't retry every frame
+            if self.controlnet is not None and id(self.controlnet) not in self._compiled_controlnet_ids:
+                try:
+                    self.controlnet.forward = torch.compile(  # type: ignore[method-assign]
+                        self.controlnet.forward,
+                        mode="reduce-overhead",
+                        dynamic=True,
+                        fullgraph=False,
+                    )
+                    self._compiled_controlnet_ids.add(id(self.controlnet))
+                    print(f"[StreamDiffusion] torch.compile enabled on ControlNet ({controlnet_mode})")
+                except Exception as e:
+                    print(f"[StreamDiffusion] ControlNet compile failed, using eager: {e}")
+                    self._compiled_controlnet_ids.add(id(self.controlnet))  # don't retry
+
         self.controlnet_conditioning_scale = self._cn.scale
         # Extract transition (explicit transition overrides auto-transition)
         transition = kwargs.get("transition", None)
