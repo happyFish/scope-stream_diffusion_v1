@@ -47,6 +47,9 @@ MODEL_PRESETS: Dict[str, dict] = {
         # tianweiy/DMD2 ships several distilled UNet checkpoints; the
         # 1-step fp16 variant is the SDXL-Turbo equivalent.
         "unet_swap": ("tianweiy/DMD2", "dmd2_sdxl_1step_unet_fp16.bin"),
+        # DMD2 was distilled at this specific timestep — feeding it
+        # LCMScheduler's default 1-step pick (~979) produces noise.
+        "timesteps_override": [399],
     },
 }
 
@@ -118,6 +121,7 @@ class StreamDiffusionPipeline(Pipeline):
         # Load the base model
         print(f"Loading model: {model_id}")
         self.model_id = model_id
+        self._timesteps_override = MODEL_PRESETS.get(model_id, {}).get("timesteps_override")
         self.pipe = self._load_model(model_id)
         print(f"Model loaded: {self.pipe.__class__.__name__}")
 
@@ -603,6 +607,7 @@ class StreamDiffusionPipeline(Pipeline):
         torch.cuda.empty_cache()
 
         self.model_id = new_model_id
+        self._timesteps_override = MODEL_PRESETS.get(new_model_id, {}).get("timesteps_override")
         self.pipe = self._load_model(new_model_id)
         print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
         self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
@@ -1143,11 +1148,29 @@ class StreamDiffusionPipeline(Pipeline):
         ), blended_pooled_embeds
 
     def _set_timesteps(self, num_inference_steps: int, strength: float):
-        """Set the timesteps for the diffusion process."""
-        self.scheduler.set_timesteps(
-            num_inference_steps, self.device, strength=strength
-        )
-        self.timesteps = self.scheduler.timesteps.to(self.device)
+        """Set the timesteps for the diffusion process.
+
+        Honors `MODEL_PRESETS[...]["timesteps_override"]` when present.
+        Distilled 1-step models (DMD2, Hyper-SD, Lightning) are trained at
+        a specific timestep and produce garbage at any other one — letting
+        LCMScheduler pick the default would feed them ~t=979 (near max
+        noise) where they were never trained.
+        """
+        if self._timesteps_override is not None:
+            # Pin the override; still call set_timesteps so the scheduler
+            # internals (timestep_scaling, etc.) are populated for any
+            # downstream lookups.
+            self.scheduler.set_timesteps(
+                num_inference_steps, self.device, strength=strength
+            )
+            self.timesteps = torch.tensor(
+                self._timesteps_override, device=self.device, dtype=torch.long
+            )
+        else:
+            self.scheduler.set_timesteps(
+                num_inference_steps, self.device, strength=strength
+            )
+            self.timesteps = self.scheduler.timesteps.to(self.device)
 
         # Make sub timesteps list
         self.sub_timesteps = []
