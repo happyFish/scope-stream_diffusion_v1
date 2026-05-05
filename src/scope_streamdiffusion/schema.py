@@ -84,9 +84,15 @@ class StreamDiffusionConfig(BasePipelineConfig):
     model_id_or_path: Literal[
         "stabilityai/sd-turbo",
         "stabilityai/sdxl-turbo",
+        "dmd2-sdxl-1step",
     ] = Field(
         default="stabilityai/sd-turbo",
-        description="HuggingFace model ID. Both entries are 1-step distillations; SDXL-Turbo additionally swaps in madebyollin/sdxl-vae-fp16-fix.",
+        description=(
+            "Model selection. All entries are 1-step distillations. "
+            "'dmd2-sdxl-1step' is SDXL-base with the DMD2 distilled UNet "
+            "(tianweiy/DMD2) swapped in — quality bump over SDXL-Turbo per "
+            "the DMD2 paper. SDXL-derived entries auto-install the fp16-fix VAE."
+        ),
         json_schema_extra=ui_field_config(order=8, label="Model"),
     )
 

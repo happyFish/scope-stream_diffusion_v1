@@ -9,6 +9,7 @@ from diffusers import (
     DiffusionPipeline,
     LCMScheduler,
     StableDiffusionXLPipeline,
+    UNet2DConditionModel,
 )
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
@@ -23,6 +24,31 @@ from .schema import StreamDiffusionConfig
 
 if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
+
+
+# Curated presets — model_id strings that aren't direct HuggingFace repos but
+# describe a (base, distillation) recipe. Extending this dict is how we add
+# new 1-step / few-step models to the dropdown without exposing the user to
+# the underlying repo plumbing.
+#
+# Schema currently exposes the `unet_swap` shape. Future shapes:
+#   "lora": (lora_repo, lora_filename) — fuse a step-LoRA at scale=1.0 onto
+#           the base. Works for Hyper-SD-1step / SDXL-Lightning-1step ONLY
+#           after `_set_timesteps` is taught about TCD / Euler schedulers
+#           (it currently calls LCM-specific
+#           `scheduler.get_scalings_for_boundary_condition_discrete`).
+#   "scheduler": SchedulerClass — override the LCMScheduler default in
+#           _swap_model. Same caveat as above re: `_set_timesteps`.
+#   "timesteps_override": [int, ...] — pin specific timesteps (Hyper-SD-1step
+#           wants [800] with TCD).
+MODEL_PRESETS: Dict[str, dict] = {
+    "dmd2-sdxl-1step": {
+        "base": "stabilityai/stable-diffusion-xl-base-1.0",
+        # tianweiy/DMD2 ships several distilled UNet checkpoints; the
+        # 1-step fp16 variant is the SDXL-Turbo equivalent.
+        "unet_swap": ("tianweiy/DMD2", "dmd2_sdxl_1step_unet_fp16.bin"),
+    },
+}
 
 
 # Import or inline the helper utilities
@@ -486,17 +512,25 @@ class StreamDiffusionPipeline(Pipeline):
             print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
-        """Load the diffusion model."""
+        """Load the diffusion model.
+
+        For HuggingFace model IDs, loads via DiffusionPipeline.from_pretrained
+        directly. For curated presets in MODEL_PRESETS, follows the preset's
+        recipe (base load + UNet swap, etc.).
+        """
         try:
-            pipe = DiffusionPipeline.from_pretrained(
-                model_id,
-                torch_dtype=self.dtype,
-                variant="fp16" if self.dtype == torch.float16 else None,
-            )
+            preset = MODEL_PRESETS.get(model_id)
+            if preset is not None:
+                pipe = self._load_preset(preset)
+            else:
+                pipe = DiffusionPipeline.from_pretrained(
+                    model_id,
+                    torch_dtype=self.dtype,
+                    variant="fp16" if self.dtype == torch.float16 else None,
+                )
             pipe = pipe.to(self.device)
 
             # Enable xformers memory-efficient attention if available.
-            # The schema declares acceleration="xformers" but this was never called.
             try:
                 pipe.enable_xformers_memory_efficient_attention()
                 print("[StreamDiffusion] xformers memory-efficient attention enabled")
@@ -507,6 +541,38 @@ class StreamDiffusionPipeline(Pipeline):
         except Exception as e:
             print(f"Failed to load model {model_id}: {e}")
             raise
+
+    def _load_preset(self, preset: dict) -> DiffusionPipeline:
+        """Build a DiffusionPipeline from a MODEL_PRESETS recipe.
+
+        Currently supports the ``unet_swap`` shape — load the base pipeline,
+        then replace its UNet with a distilled checkpoint. Other recipe
+        shapes (LoRA fuse, scheduler override, timesteps_override) will land
+        alongside the `_set_timesteps` refactor needed to support
+        non-LCM schedulers.
+        """
+        base = preset["base"]
+        print(f"[StreamDiffusion] Loading preset: base={base}")
+
+        unet_swap = preset.get("unet_swap")
+        if unet_swap is not None:
+            unet_repo, unet_file = unet_swap
+            print(f"[StreamDiffusion] Loading distilled UNet: {unet_repo}/{unet_file}")
+            unet = UNet2DConditionModel.from_pretrained(
+                unet_repo, weight_name=unet_file, torch_dtype=self.dtype
+            )
+            pipe = DiffusionPipeline.from_pretrained(
+                base,
+                unet=unet,
+                torch_dtype=self.dtype,
+                variant="fp16" if self.dtype == torch.float16 else None,
+            )
+            return pipe
+
+        # Other preset shapes (LoRA fuse, etc.) land here once supported.
+        raise NotImplementedError(
+            f"MODEL_PRESETS recipe shape not yet implemented: {preset}"
+        )
 
     def _swap_model(self, new_model_id: str) -> None:
         """Replace the loaded model in place.
