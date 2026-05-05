@@ -92,11 +92,9 @@ class StreamDiffusionPipeline(Pipeline):
         # Load the base model
         print(f"Loading model: {model_id}")
         self.model_id = model_id
-        self.sd_turbo = "turbo" in model_id.lower()
         self.pipe = self._load_model(model_id)
         print(f"Model loaded: {self.pipe.__class__.__name__}")
 
-        # Check if SDXL (needed before LCM LoRA selection)
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
 
         # SDXL's default VAE overflows in fp16 and decodes NaN. Swap to the
@@ -105,12 +103,7 @@ class StreamDiffusionPipeline(Pipeline):
         if self.sdxl and self.dtype == torch.float16:
             self._install_sdxl_fp16_vae()
 
-        # Non-turbo models need LCM LoRA to denoise correctly with LCMScheduler
-        # at 1–4 steps. Turbo/Lightning models are already distilled for this.
-        if not self.sd_turbo:
-            self._attach_lcm_lora()
-
-        # Model components (grabbed after LoRA fuse so fused weights are live)
+        # Model components
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
         self.vae = self.pipe.vae
@@ -537,14 +530,11 @@ class StreamDiffusionPipeline(Pipeline):
         torch.cuda.empty_cache()
 
         self.model_id = new_model_id
-        self.sd_turbo = "turbo" in new_model_id.lower()
         self.pipe = self._load_model(new_model_id)
         print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
         self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
         if self.sdxl and self.dtype == torch.float16:
             self._install_sdxl_fp16_vae()
-        if not self.sd_turbo:
-            self._attach_lcm_lora()
 
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
@@ -592,29 +582,6 @@ class StreamDiffusionPipeline(Pipeline):
             print("[StreamDiffusion] SDXL fp16-fix VAE installed")
         except Exception as e:
             print(f"[StreamDiffusion] Failed to install fp16-fix VAE: {e}")
-
-    def _attach_lcm_lora(self) -> None:
-        """Load and fuse the appropriate LCM LoRA for a non-turbo SD/SDXL base.
-
-        LCMScheduler at 1–4 steps only produces usable output on models that
-        have been distilled for low-step inference — Turbo, Lightning, or LCM.
-        For plain SD 1.5 / SDXL bases, we attach the matching LCM LoRA so the
-        scheduler path works the same as it does for Turbo.
-        """
-        lcm_lora_id = (
-            "latent-consistency/lcm-lora-sdxl"
-            if self.sdxl
-            else "latent-consistency/lcm-lora-sdv1-5"
-        )
-        print(f"[StreamDiffusion] Loading LCM LoRA: {lcm_lora_id}")
-        try:
-            self.pipe.load_lora_weights(lcm_lora_id, adapter_name="lcm")
-            self.pipe.fuse_lora(lora_scale=1.0, adapter_names=["lcm"])
-            self.pipe.unload_lora_weights()
-            print("[StreamDiffusion] LCM LoRA fused")
-        except Exception as e:
-            print(f"[StreamDiffusion] Failed to load LCM LoRA {lcm_lora_id}: {e}")
-            raise
 
     def _set_taesd(self, enabled: bool) -> None:
         """Switch between TAESD (fast) and full VAE decoder."""
@@ -750,19 +717,7 @@ class StreamDiffusionPipeline(Pipeline):
             self._last_seed = seed
 
         if seed_changed or shape_changed:
-            if self.denoising_steps_num > 1:
-                self.x_t_latent_buffer = torch.zeros(
-                    (
-                        (self.denoising_steps_num - 1) * self.frame_bff_size,
-                        4,
-                        self.latent_height,
-                        self.latent_width,
-                    ),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-            else:
-                self.x_t_latent_buffer = None
+            self.x_t_latent_buffer = None
             self._initialize_noise()
             self._noise_shape = noise_shape
 
@@ -1376,11 +1331,6 @@ class StreamDiffusionPipeline(Pipeline):
 
         if self.use_denoising_batch:
             t_list = self.sub_timesteps_tensor
-            if self.denoising_steps_num > 1:
-                x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
-                self.stock_noise = torch.cat(
-                    (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
-                )
             if self.sdxl:
                 batch = x_t_latent.shape[0]
                 te = self.add_text_embeds.to(self.device)
@@ -1397,20 +1347,8 @@ class StreamDiffusionPipeline(Pipeline):
                 x_t_latent, t_list, added_cond_kwargs=added_cond_kwargs
             )
 
-            if self.denoising_steps_num > 1:
-                x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
-                if self.do_add_noise:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                        + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
-                    )
-                else:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                    )
-            else:
-                x_0_pred_out = x_0_pred_batch
-                self.x_t_latent_buffer = None
+            x_0_pred_out = x_0_pred_batch
+            self.x_t_latent_buffer = None
         else:
             self.init_noise = x_t_latent
             for idx, t in enumerate(self.sub_timesteps_tensor):
@@ -1441,63 +1379,6 @@ class StreamDiffusionPipeline(Pipeline):
             x_0_pred_out = x_0_pred
 
         return x_0_pred_out
-
-    @torch.no_grad()
-    def _predict_x0_serial(
-        self,
-        latent: torch.Tensor,
-        num_inference_steps: int,
-        strength: float = 1.0,
-        is_img2img: bool = False,
-    ) -> torch.Tensor:
-        """Run a clean N-step LCM denoise loop on a single latent.
-
-        Sibling of :meth:`_predict_x0_batch` for modes where the streaming
-        rolling-buffer trick gets in the way (steady-prompt txt2img and
-        image-loopback) — runs all N timesteps inside one call so the output
-        is a single fully-denoised frame, not one slice of a 4-track buffer
-        cycle.
-
-        For txt2img, ``latent`` is pure noise and we walk every timestep in
-        the schedule. For img2img / loopback, ``latent`` is the cleanly-
-        encoded input image; we add fresh noise at the first timestep we
-        actually run, controlled by ``strength`` (1.0 = full repaint, lower
-        = preserve more of the input).
-        """
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        timesteps = self.scheduler.timesteps
-
-        if is_img2img:
-            skip = max(0, int(round(num_inference_steps * (1.0 - strength))))
-            timesteps = timesteps[skip:]
-            if len(timesteps) == 0:
-                return latent
-            noise = torch.randn(
-                latent.shape, generator=self.generator,
-                device=self.device, dtype=self.dtype,
-            )
-            latent = self.scheduler.add_noise(latent, noise, timesteps[:1])
-
-        added_cond_kwargs = {}
-        if self.sdxl:
-            added_cond_kwargs = {
-                "text_embeds": self.add_text_embeds.to(self.device),
-                "time_ids": self.add_time_ids.to(self.device),
-            }
-
-        prompt_embeds = self.prompt_embeds[:1]  # serial works one frame at a time
-        for t in timesteps:
-            noise_pred = self.unet(
-                latent,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs=added_cond_kwargs,
-                return_dict=False,
-            )[0]
-            latent = self.scheduler.step(
-                noise_pred, t, latent, return_dict=False
-            )[0]
-        return latent
 
     @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
@@ -1589,13 +1470,8 @@ class StreamDiffusionPipeline(Pipeline):
         prompt_interpolation_method = get_param("prompt_interpolation_method", "linear")
         guidance_scale = get_param("guidance_scale", 0.0)
 
-        num_inference_steps = get_param("num_inference_steps", 4)
-        use_suggested_steps = get_param("use_suggested_num_inference_steps", True)
-        if use_suggested_steps:
-            # Per-family suggestion: SD-Turbo proper is 1-step distilled; every
-            # other family (SDXL-Turbo, SDXL-Turbo fine-tunes, SD1.5/SDXL +
-            # LCM LoRA) needs 4 steps to converge to sharp output.
-            num_inference_steps = 1 if (self.sd_turbo and not self.sdxl) else 4
+        # SD-Turbo and SDXL-Turbo are both 1-step distillations.
+        num_inference_steps = 1
 
         # For img2img with SD Turbo, need higher strength for visible changes
         # 0.5-0.7 = moderate, 0.8-0.95 = heavy transformation
@@ -1625,30 +1501,6 @@ class StreamDiffusionPipeline(Pipeline):
         # acceleration_mode is locked at init (see __init__) — runtime updates
         # don't change it because TRT engines can't be hot-swapped.
         acceleration_mode = self._acceleration_mode
-
-        # --- Pick denoise path -------------------------------------------------
-        # The batch path (StreamDiffusion's rolling-buffer trick) amortises N
-        # denoising stages across N consecutive video frames. That's a real
-        # win when the input stream changes every frame (webcam, v2v, moving
-        # ControlNet) but in steady-prompt txt2img / image-loopback the per-
-        # slot init_noise drift makes the N buffer slots crystallise into N
-        # different attractors that flash one after another.
-        # Use the serial path for those cases; keep the batch path everywhere
-        # else and at num_inference_steps=1 (where it degenerates to one
-        # UNet call per frame anyway).
-        has_video_input_eval = video is not None and len(video) > 0
-        is_steady_prompt_mode = (not has_video_input_eval) or image_loopback
-        use_serial = (
-            num_inference_steps > 1
-            and is_steady_prompt_mode
-            and controlnet_mode == "none"
-        )
-        if use_serial:
-            # Serial denoise wants prompt_embeds sized for batch=1 and doesn't
-            # care about the LCM coefficient pre-compute. Force the runtime
-            # state into a 1-track configuration so _prepare_runtime_state's
-            # caches match what _predict_x0_serial will read.
-            use_denoising_batch = False
 
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
         # LCM scheduler requires: floor(original_steps * strength) >= num_inference_steps
@@ -1790,9 +1642,7 @@ class StreamDiffusionPipeline(Pipeline):
                     return {"video": output.permute(0, 2, 3, 1).clamp(0, 1)}
                 input_tensor = filtered
 
-            # Encode to latent space. Serial img2img adds its own noise based
-            # on the requested strength, so don't double-noise here.
-            input_latent = self._encode_image(input_tensor, add_noise=not use_serial)
+            input_latent = self._encode_image(input_tensor, add_noise=True)
 
         else:
             # Text-to-image mode — use the seeded `init_noise` instead of a
@@ -1802,16 +1652,7 @@ class StreamDiffusionPipeline(Pipeline):
             # user reseed deterministically by changing `seed`).
             input_latent = self.init_noise[0:1].clone()
 
-        # Run diffusion
-        if use_serial:
-            x_0_pred_out = self._predict_x0_serial(
-                input_latent,
-                num_inference_steps=num_inference_steps,
-                strength=strength,
-                is_img2img=frame is not None,
-            )
-        else:
-            x_0_pred_out = self._predict_x0_batch(input_latent)
+        x_0_pred_out = self._predict_x0_batch(input_latent)
         # Decode to image space
         x_output = self._decode_image(x_0_pred_out).detach().clone()
         # Normalize from [-1, 1] to [0, 1] (VAE outputs in range [-1, 1])
@@ -1868,7 +1709,6 @@ def main():
     test_params = {
         "prompt": "A beautiful sunset over mountains",
         "negative_prompt": "ugly, blurry, low quality",
-        "num_inference_steps": 4,
         "guidance_scale": 0.0,
         "strength": 0.99,
         "seed": 42,
@@ -1881,7 +1721,6 @@ def main():
 
     print("\nTest parameters:")
     print(f"  Prompt: {test_params['prompt']}")
-    print(f"  Steps: {test_params['num_inference_steps']}")
     print(f"  Size: {test_params['width']}x{test_params['height']}")
     print("\nRunning pipeline 10 times...\n")
 
