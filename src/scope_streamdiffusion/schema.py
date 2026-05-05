@@ -1,14 +1,38 @@
 """Configuration schema for StreamDiffusion pipeline."""
 
+from enum import IntEnum
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     InputMode,
     ModeDefaults,
     ui_field_config,
 )
+
+
+class Resolution(IntEnum):
+    """Allowed pixel dimensions for width/height.
+
+    Multiples of 64 in [256, 1024]. UNet downsamples latents 3x and ControlNet
+    residuals land at /8 in latent space, so pixel dims must divide by 64. TRT
+    engines are built for this dynamic range.
+    """
+
+    R256 = 256
+    R320 = 320
+    R384 = 384
+    R448 = 448
+    R512 = 512
+    R576 = 576
+    R640 = 640
+    R704 = 704
+    R768 = 768
+    R832 = 832
+    R896 = 896
+    R960 = 960
+    R1024 = 1024
 
 
 class StreamDiffusionConfig(BasePipelineConfig):
@@ -44,13 +68,13 @@ class StreamDiffusionConfig(BasePipelineConfig):
     enabled: bool = Field(
         default=True,
         description="Enable pipeline processing. When disabled, input video is passed through unchanged.",
-        json_schema_extra=ui_field_config(order=0, label="Enabled"),
+        #json_schema_extra=ui_field_config(order=0, label="Enabled"),
     )
 
     input_mode: InputMode = Field(
         default="text",
         description="Input mode: 'text' generates from prompts only, 'video' transforms input frames",
-        json_schema_extra=ui_field_config(order=1, label="Input Mode"),
+        #json_schema_extra=ui_field_config(order=1, label="Input Mode"),
     )
 
     # ========================================
@@ -71,13 +95,13 @@ class StreamDiffusionConfig(BasePipelineConfig):
             "requires pipeline reload. Engines support dynamic resolution 256-1024 "
             "and batch 1-4."
         ),
-        json_schema_extra=ui_field_config(order=2, label="Acceleration"),
+        #json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
 
     use_taesd: bool = Field(
         default=True,
         description="Use Tiny AutoEncoder (TAESD) for ~10x faster VAE decoding at slight quality cost",
-        json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
+        #json_schema_extra=ui_field_config(order=2, label="Use TAESD"),
     )
 
     controlnet_mode: Literal["none", "depth", "scribble"] = Field(
@@ -99,7 +123,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=1,
         description="Minimum depth value for ControlNet",
-        json_schema_extra=ui_field_config(order=5, label="Depth Min"),
+        #json_schema_extra=ui_field_config(order=5, label="Depth Min"),
     )
 
     depth_max: float = Field(
@@ -107,27 +131,27 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=1,
         description="Maximum depth value for ControlNet",
-        json_schema_extra=ui_field_config(order=6, label="Depth Max"),
+        #json_schema_extra=ui_field_config(order=6, label="Depth Max"),
     )
 
     depth_skip_interval: int = Field(
-        default=3,
+        default=2,
         ge=1,
         le=10,
         description="Run depth model every Nth frame; reuse cached depth map on intermediate frames. Higher = less GPU cost, more temporal lag.",
-        json_schema_extra=ui_field_config(order=7, label="Depth Skip Interval"),
+        #json_schema_extra=ui_field_config(order=7, label="Depth Skip Interval"),
     )
 
     depth_input_size: Literal[252, 364, 518] = Field(
-        default=518,
+        default=252,
         description="Resolution the depth model runs at (must be multiple of 14). Lower = faster but coarser depth. 252 ≈ 4× faster than 518; the depth map is bilinear-upsampled to controlnet resolution either way.",
-        json_schema_extra=ui_field_config(order=8, label="Depth Input Size"),
+        #json_schema_extra=ui_field_config(order=8, label="Depth Input Size"),
     )
 
     depth_temporal_cache: bool = Field(
         default=True,
         description="Use the video model's temporal hidden-state cache for inter-frame consistency. Disabling skips the temporal motion modules entirely (faster, slightly more flicker). Combined with skip interval > 1 the cache buys little, so toggle off for speed.",
-        json_schema_extra=ui_field_config(order=9, label="Depth Temporal Cache"),
+        #json_schema_extra=ui_field_config(order=9, label="Depth Temporal Cache"),
     )
 
     controlnet_temporal_smoothing: float = Field(
@@ -135,7 +159,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=1.0,
         description="Temporal blending of the ControlNet conditioning map. 0.0 = fully smoothed (previous frame only), 1.0 = no smoothing (current frame only). Lower values reduce flicker; higher values reduce latency.",
-        json_schema_extra=ui_field_config(order=5, label="ControlNet Smoothing"),
+        #json_schema_extra=ui_field_config(order=5, label="ControlNet Smoothing"),
     )
 
     # ========================================
@@ -146,7 +170,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     negative_prompt: str = Field(
         default="",
         description="Negative prompt — what to avoid in the generated image",
-        json_schema_extra=ui_field_config(order=11, label="Negative Prompt"),
+        #json_schema_extra=ui_field_config(order=11, label="Negative Prompt"),
     )
 
     negative_prompt_scale: float = Field(
@@ -154,7 +178,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
         ge=0.0,
         le=2.0,
         description="Strength of embedding-space negative guidance (used when guidance_scale=0). Subtracts the negative prompt embedding from the positive. 0 = disabled, 1 = full subtraction.",
-        json_schema_extra=ui_field_config(order=12, label="Negative Scale"),
+        #json_schema_extra=ui_field_config(order=12, label="Negative Scale"),
     )
 
     prompt_interpolation_method: Literal["linear", "slerp"] = Field(
@@ -171,7 +195,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
             "0 = hard cut (can cause garbage frames); 8-30 is typical for smooth "
             "prompt morphs. Ignored when an explicit transition dict is sent."
         ),
-        json_schema_extra=ui_field_config(order=10, label="Transition Steps"),
+        #json_schema_extra=ui_field_config(order=10, label="Transition Steps"),
     )
 
     seed: int = Field(
@@ -195,7 +219,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     num_inference_steps: int = Field(
-        default=2,
+        default=1,
         ge=1,
         le=50,
         description="Number of denoising steps",
@@ -265,7 +289,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
     image_loopback: bool = Field(
         default=False,
         description="Use last frame as input for the next generation",
-        json_schema_extra=ui_field_config(order=49, label="Image Loopback"),
+        #json_schema_extra=ui_field_config(order=49, label="Image Loopback"),
     )
 
     # ========================================
@@ -279,7 +303,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
             "mask. SD output goes where mask=1, original goes where mask=0. "
             "Flip directions by toggling the upstream segmenter's Invert Mask."
         ),
-        json_schema_extra=ui_field_config(order=55, label="Mask Compositing"),
+        #json_schema_extra=ui_field_config(order=55, label="Mask Compositing"),
     )
 
     mask_feather: float = Field(
@@ -290,7 +314,7 @@ class StreamDiffusionConfig(BasePipelineConfig):
             "Soft mask edges (pixels). 0 = hard edge. Cheap box-blur applied "
             "to the mask before compositing."
         ),
-        json_schema_extra=ui_field_config(order=56, label="Mask Feather"),
+        #json_schema_extra=ui_field_config(order=56, label="Mask Feather"),
     )
 
     mask_strength: float = Field(
@@ -301,24 +325,29 @@ class StreamDiffusionConfig(BasePipelineConfig):
             "Overall mask blend strength. 0 disables compositing, 1 is full effect. "
             "Use intermediate values to ghost the original through the SD output."
         ),
-        json_schema_extra=ui_field_config(order=57, label="Mask Strength"),
+        #json_schema_extra=ui_field_config(order=57, label="Mask Strength"),
     )
 
-    # Resolution settings — must be a multiple of 64 (UNet downsamples latents
-    # 3x; ControlNet residuals go to /8 in latent space, so pixel dim has to
-    # divide by 64). TRT engines are built for the 256-1024 dynamic range.
-    width: Literal[
-        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
-    ] = Field(
-        default=512,
+    width: Resolution = Field(
+        default=Resolution.R512,
         description="Output width (multiple of 64, 256-1024)",
-        json_schema_extra=ui_field_config(order=60, label="Width"),
+        #json_schema_extra=ui_field_config(order=60, label="Width"),
     )
 
-    height: Literal[
-        256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
-    ] = Field(
-        default=512,
+    height: Resolution = Field(
+        default=Resolution.R512,
         description="Output height (multiple of 64, 256-1024)",
-        json_schema_extra=ui_field_config(order=61, label="Height"),
+        #json_schema_extra=ui_field_config(order=61, label="Height"),
     )
+
+    @field_validator("width", "height", mode="before")
+    @classmethod
+    def _validate_resolution(cls, v: object) -> Resolution:
+        try:
+            return Resolution(int(v))  # type: ignore[arg-type]
+        except (ValueError, TypeError) as e:
+            allowed = ", ".join(str(r.value) for r in Resolution)
+            raise ValueError(
+                f"Resolution must be one of: {allowed} (multiples of 64 in [256, 1024]); got {v!r}"
+            ) from e
+
