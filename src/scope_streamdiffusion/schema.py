@@ -84,13 +84,9 @@ class StreamDiffusionConfig(BasePipelineConfig):
     model_id_or_path: Literal[
         "stabilityai/sd-turbo",
         "stabilityai/sdxl-turbo",
-        "stable-diffusion-v1-5/stable-diffusion-v1-5",
-        "stabilityai/stable-diffusion-xl-base-1.0",
-        "Lykon/dreamshaper-8",
-        "Lykon/dreamshaper-xl-v2-turbo",
     ] = Field(
         default="stabilityai/sd-turbo",
-        description="HuggingFace model ID. Tested set; non-Turbo entries auto-attach the matching LCM LoRA, SDXL entries auto-swap to madebyollin/sdxl-vae-fp16-fix.",
+        description="HuggingFace model ID. Both entries are 1-step distillations; SDXL-Turbo additionally swaps in madebyollin/sdxl-vae-fp16-fix.",
         json_schema_extra=ui_field_config(order=8, label="Model"),
     )
 
@@ -224,20 +220,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
         le=8.0,
         description="Classifier-free guidance scale (0 = none, higher = more prompt adherence)",
         # json_schema_extra=ui_field_config(order=20, label="Guidance Scale"),
-    )
-
-    num_inference_steps: int = Field(
-        default=4,
-        ge=1,
-        le=50,
-        description="Number of LCM denoising steps. Main sharpness lever: more steps = sharper detail. SD-Turbo (sd-turbo) is distilled for 1 step; SDXL-Turbo / fine-tunes / non-turbo + LCM LoRA all want 4–8.",
-        json_schema_extra=ui_field_config(order=21, label="Inference Steps"),
-    )
-
-    use_suggested_num_inference_steps: bool = Field(
-        default=True,
-        description="When ON, the pipeline picks the inference-step count per model family (1 for SD-Turbo, 4 for everything else) and ignores the slider. Toggle OFF to drive the slider yourself.",
-        json_schema_extra=ui_field_config(order=22, label="Auto Inference Steps"),
     )
 
     strength: float = Field(
