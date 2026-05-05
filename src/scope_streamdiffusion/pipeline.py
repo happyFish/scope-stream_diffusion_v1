@@ -17,6 +17,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 from scope.core.pipelines.interface import Pipeline, Requirements
 from scope.core.pipelines.blending import EmbeddingBlender, parse_transition_config
 
+from . import _trt_cache
 from .controlnet import ControlNetHandler
 from .schema import StreamDiffusionConfig
 
@@ -126,6 +127,14 @@ class StreamDiffusionPipeline(Pipeline):
         if self._acceleration_mode == "trt":
             print(f"[TRT] acceleration_mode='trt' detected at init")
 
+        # Identify this pipeline instance for the cross-instance TRT adapter
+        # cache. node_id is the user-supplied graph node id from Scope and is
+        # stable across graph edits; until upstream Scope passes it through,
+        # we fall back to a model-scoped anon key (correct for a single SD
+        # node, the common case).
+        self._node_id: str | None = kwargs.get("node_id")
+        self._trt_cache_key: str = _trt_cache.cache_key(self._node_id, model_id)
+
         # Check if SDXL
         self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
 
@@ -208,6 +217,23 @@ class StreamDiffusionPipeline(Pipeline):
             return
         if self._taesd_vae is None:
             return
+
+        signature = (self._model_id_for_trt, int(self.height), int(self.width))
+        cache_state, restored = _trt_cache.get_or_create(self._trt_cache_key, signature)
+        if self._trt_cuda_stream is None and cache_state.cuda_stream is not None:
+            self._trt_cuda_stream = cache_state.cuda_stream
+        if restored and cache_state.taesd_adapter is not None:
+            self._trt_eager_taesd = self._taesd_vae
+            self._taesd_vae = cache_state.taesd_adapter
+            if self._using_taesd:
+                self.vae = cache_state.taesd_adapter
+            self._trt_taesd_built = True
+            print(
+                f"[TRT] TAESD adapter restored from cache (key={self._trt_cache_key})",
+                flush=True,
+            )
+            return
+
         self._trt_taesd_built = True  # prevent retry on failure
 
         from .trt_engines import (
@@ -217,6 +243,7 @@ class StreamDiffusionPipeline(Pipeline):
         )
         if self._trt_cuda_stream is None:
             self._trt_cuda_stream = make_cuda_stream()
+        cache_state.cuda_stream = self._trt_cuda_stream
         print(
             "[TRT] Preparing TAESD engines — first build takes ~1 min, cached after",
             flush=True,
@@ -245,6 +272,7 @@ class StreamDiffusionPipeline(Pipeline):
         self._taesd_vae = adapter
         if self._using_taesd:
             self.vae = adapter
+        cache_state.taesd_adapter = adapter
         print(f"[TRT] TAESD engines active: enc={enc_path.name}, dec={dec_path.name}", flush=True)
 
     def _ensure_trt_controlnet(self, mode: str) -> None:
@@ -265,6 +293,24 @@ class StreamDiffusionPipeline(Pipeline):
                 self._trt_eager_controlnets[mode] = self._cn.model
                 self.controlnet = adapter
             return
+
+        signature = (self._model_id_for_trt, int(self.height), int(self.width))
+        cache_state, restored = _trt_cache.get_or_create(self._trt_cache_key, signature)
+        if self._trt_cuda_stream is None and cache_state.cuda_stream is not None:
+            self._trt_cuda_stream = cache_state.cuda_stream
+        cached_cn = cache_state.cn_adapters.get(mode) if restored else None
+        if cached_cn is not None:
+            self._trt_eager_controlnets[mode] = self._cn.model
+            self._trt_cn_engines[mode] = cached_cn
+            self._trt_cn_built_modes.add(mode)
+            self.controlnet = cached_cn
+            print(
+                f"[TRT] ControlNet adapter restored from cache "
+                f"(mode={mode}, key={self._trt_cache_key})",
+                flush=True,
+            )
+            return
+
         self._trt_cn_built_modes.add(mode)  # mark before build to prevent retry storm
 
         from .trt_engines import (
@@ -275,6 +321,7 @@ class StreamDiffusionPipeline(Pipeline):
 
         if self._trt_cuda_stream is None:
             self._trt_cuda_stream = make_cuda_stream()
+        cache_state.cuda_stream = self._trt_cuda_stream
 
         # ControlNet ONNX export needs default attention too (same xformers
         # issue as the UNet path).
@@ -304,6 +351,7 @@ class StreamDiffusionPipeline(Pipeline):
         self._trt_eager_controlnets[mode] = self._cn.model
         self._trt_cn_engines[mode] = adapter
         self.controlnet = adapter
+        cache_state.cn_adapters[mode] = adapter
         print(f"[TRT] ControlNet engine active ({mode}): {engine_path}", flush=True)
 
     def _ensure_trt_unet(self, controlnet_mode: str = "none") -> None:
@@ -330,6 +378,26 @@ class StreamDiffusionPipeline(Pipeline):
                 f"[TRT] UNet ctrl-input variant changed "
                 f"(had={self._trt_unet_has_controlnet}, want={want_control}); rebuilding"
             )
+
+        signature = (self._model_id_for_trt, int(self.height), int(self.width))
+        cache_state, restored = _trt_cache.get_or_create(self._trt_cache_key, signature)
+        if self._trt_cuda_stream is None and cache_state.cuda_stream is not None:
+            self._trt_cuda_stream = cache_state.cuda_stream
+        if (
+            restored
+            and cache_state.unet_adapter is not None
+            and cache_state.unet_has_controlnet == want_control
+        ):
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = cache_state.unet_adapter
+            self._trt_unet_built = True
+            self._trt_unet_has_controlnet = want_control
+            print(
+                f"[TRT] UNet adapter restored from cache "
+                f"(want_control={want_control}, key={self._trt_cache_key})",
+                flush=True,
+            )
+            return
 
         # Set sticky flags before the build so failures don't retry every frame.
         self._trt_unet_built = True
@@ -361,6 +429,7 @@ class StreamDiffusionPipeline(Pipeline):
 
         if self._trt_cuda_stream is None:
             self._trt_cuda_stream = make_cuda_stream()
+        cache_state.cuda_stream = self._trt_cuda_stream
 
         if want_control:
             print(
@@ -380,6 +449,8 @@ class StreamDiffusionPipeline(Pipeline):
             self.unet = TRTUNetWithControlAdapter(
                 engine_path, self._trt_cuda_stream, num_down_residuals=12,
             )
+            cache_state.unet_adapter = self.unet
+            cache_state.unet_has_controlnet = True
             print(f"[TRT] UNet+ctrl engine active: {engine_path}", flush=True)
         else:
             print(
@@ -396,6 +467,8 @@ class StreamDiffusionPipeline(Pipeline):
             )
             self._trt_eager_unet = self.pipe.unet
             self.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
+            cache_state.unet_adapter = self.unet
+            cache_state.unet_has_controlnet = False
             print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
     def _load_model(self, model_id: str) -> DiffusionPipeline:
