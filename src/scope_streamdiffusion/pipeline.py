@@ -546,33 +546,40 @@ class StreamDiffusionPipeline(Pipeline):
         """Build a DiffusionPipeline from a MODEL_PRESETS recipe.
 
         Currently supports the ``unet_swap`` shape — load the base pipeline,
-        then replace its UNet with a distilled checkpoint. Other recipe
-        shapes (LoRA fuse, scheduler override, timesteps_override) will land
-        alongside the `_set_timesteps` refactor needed to support
+        then override its UNet weights from a distilled checkpoint. Other
+        recipe shapes (LoRA fuse, scheduler override, timesteps_override)
+        will land alongside the `_set_timesteps` refactor needed to support
         non-LCM schedulers.
         """
         base = preset["base"]
-        print(f"[StreamDiffusion] Loading preset: base={base}")
+        print(f"[StreamDiffusion] Loading preset base: {base}")
+        pipe = DiffusionPipeline.from_pretrained(
+            base,
+            torch_dtype=self.dtype,
+            variant="fp16" if self.dtype == torch.float16 else None,
+        )
 
         unet_swap = preset.get("unet_swap")
         if unet_swap is not None:
+            from huggingface_hub import hf_hub_download
+
             unet_repo, unet_file = unet_swap
-            print(f"[StreamDiffusion] Loading distilled UNet: {unet_repo}/{unet_file}")
-            unet = UNet2DConditionModel.from_pretrained(
-                unet_repo, weight_name=unet_file, torch_dtype=self.dtype
-            )
-            pipe = DiffusionPipeline.from_pretrained(
-                base,
-                unet=unet,
-                torch_dtype=self.dtype,
-                variant="fp16" if self.dtype == torch.float16 else None,
-            )
+            print(f"[StreamDiffusion] Downloading distilled UNet: {unet_repo}/{unet_file}")
+            ckpt_path = hf_hub_download(unet_repo, unet_file)
+            # Distilled-UNet repos (DMD2, SDXL-Lightning, etc.) often ship
+            # weights only — no config.json — because the architecture is
+            # identical to the base UNet. Reuse the base pipeline's UNet
+            # module and override its state_dict.
+            if unet_file.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(ckpt_path)
+            else:
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+            pipe.unet.load_state_dict(state_dict)
+            print("[StreamDiffusion] Distilled UNet weights loaded")
             return pipe
 
-        # Other preset shapes (LoRA fuse, etc.) land here once supported.
-        raise NotImplementedError(
-            f"MODEL_PRESETS recipe shape not yet implemented: {preset}"
-        )
+        return pipe
 
     def _swap_model(self, new_model_id: str) -> None:
         """Replace the loaded model in place.
