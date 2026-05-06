@@ -293,9 +293,10 @@ class StreamDiffusionPipeline(Pipeline):
             flush=True,
         )
         try:
+            taesd_model_id = "madebyollin/taesdxl" if self.sdxl else "madebyollin/taesd"
             enc_path, dec_path = build_taesd_engines(
                 self._taesd_vae,
-                model_id="madebyollin/taesd",
+                model_id=taesd_model_id,
                 image_height=int(self.height),
                 image_width=int(self.width),
                 min_batch_size=1,

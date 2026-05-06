@@ -1,6 +1,6 @@
 """Configuration schema for StreamDiffusion pipeline."""
 
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Literal
 
 from pydantic import Field, field_validator
@@ -10,6 +10,14 @@ from scope.core.pipelines.base_schema import (
     ModeDefaults,
     ui_field_config,
 )
+
+
+class ModelId(StrEnum):
+    """Supported StreamDiffusion models (all 1-step distillations)."""
+
+    SD_TURBO = "stabilityai/sd-turbo"
+    SDXL_TURBO = "stabilityai/sdxl-turbo"
+    DMD2_SDXL_1STEP = "dmd2-sdxl-1step"
 
 
 class Resolution(IntEnum):
@@ -81,12 +89,8 @@ class StreamDiffusionConfig(BasePipelineConfig):
     # Model Configuration
     # ========================================
 
-    model_id_or_path: Literal[
-        "stabilityai/sd-turbo",
-        "stabilityai/sdxl-turbo",
-        "dmd2-sdxl-1step",
-    ] = Field(
-        default="stabilityai/sd-turbo",
+    model_id_or_path: ModelId = Field(
+        default=ModelId.SD_TURBO,
         description=(
             "Model selection. All entries are 1-step distillations. "
             "'dmd2-sdxl-1step' is SDXL-base with the DMD2 distilled UNet "
