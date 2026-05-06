@@ -99,11 +99,16 @@ class StreamDiffusionConfig(BasePipelineConfig):
     acceleration_mode: Literal["none", "trt"] = Field(
         default="trt",
         description=(
-            "TRT-compile UNet (and ControlNet) for ~2-3x denoising speedup. "
-            "First build per (model, batch range) takes 5-10 min and caches to "
-            "~/.cache/scope-streamdiffusion-trt/. Set at session start; changing "
-            "requires pipeline reload. Engines support dynamic resolution 256-1024 "
-            "and batch 1-4."
+            "TRT-compile UNet (and ControlNet on SD 1.5) for 2-8x denoising "
+            "speedup. First build per model takes 5-10 min and caches to "
+            "~/.cache/scope-streamdiffusion-trt/. Set at session start; "
+            "changing requires pipeline reload. SD 1.5 engines support "
+            "dynamic resolution 256-1024 and batch 1-4. SDXL engines "
+            "(sdxl-turbo, dmd2-sdxl-1step) support dynamic resolution "
+            "512-1024 with static batch=1 — different envelope to fit a "
+            "24 GB VRAM build budget. SDXL + ControlNet + TRT is not yet "
+            "supported (raises NotImplementedError); use acceleration='none' "
+            "with controlnet on SDXL until that lands."
         ),
         #json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
