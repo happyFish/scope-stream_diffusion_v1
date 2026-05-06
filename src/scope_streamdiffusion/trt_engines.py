@@ -376,7 +376,9 @@ def build_unet_sdxl_engine(
     image_height: int = 1024,
     image_width: int = 1024,
     min_batch_size: int = 1,
-    max_batch_size: int = 4,
+    max_batch_size: int = 1,
+    min_image_resolution: int = 512,
+    max_image_resolution: int = 1024,
 ) -> Path:
     """Build (or reuse) a TRT engine for an SDXL UNet.
 
@@ -384,10 +386,26 @@ def build_unet_sdxl_engine(
     `text_embeds` and `time_ids` as engine inputs so SDXL's `get_aug_embed`
     has the kwargs it expects. Without these the ONNX export crashes with
     `TypeError: argument of type 'NoneType' is not iterable`.
+
+    Dynamic-shape build over [min_image_resolution, max_image_resolution]
+    on both axes — runtime can pick any resolution in that range without
+    triggering a rebuild. The opt point (image_height, image_width) is
+    where TRT's tactic selection is centered; runs at the opt size are
+    fastest, runs at min/max get slightly suboptimal tactics.
+
+    Default range 512–1024 is the tightest envelope that covers SDXL's
+    sweet spot. Wider ranges (256–1024) blow past the builder's memory
+    budget on 24 GB cards. Static batch (max=1) is kept because
+    guidance_scale=0 (default for Turbo / DMD2) means inference never
+    uses batch>1; allowing batch>1 doubles the workspace.
     """
     from ._trt import UNetSDXL, compile_unet_sdxl, create_onnx_path
 
-    suffix = f"unet_sdxl_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
+    suffix = (
+        f"unet_sdxl_b{min_batch_size}-{max_batch_size}_"
+        f"h{min_image_resolution}-{max_image_resolution}_"
+        f"w{min_image_resolution}-{max_image_resolution}"
+    )
     cache_dir = _model_cache_dir(model_id, suffix)
     onnx_dir = cache_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -407,11 +425,6 @@ def build_unet_sdxl_engine(
         embedding_dim=unet.config.cross_attention_dim,
         unet_dim=unet.config.in_channels,
     )
-    # SDXL UNet build is memory-heavy; locking to static shape and static
-    # batch keeps TRT's tactic exploration bounded and the build fits in
-    # VRAM. Loses dynamic-shape flexibility (engine only valid at one
-    # resolution) but unblocks getting an engine produced at all. Dynamic
-    # shapes are a follow-up once the static path is verified.
     compile_unet_sdxl(
         unet, unet_model,
         str(create_onnx_path("unet_sdxl", str(onnx_dir), opt=False)),
@@ -419,13 +432,14 @@ def build_unet_sdxl_engine(
         str(engine_path),
         opt_batch_size=min_batch_size,
         engine_build_options={
-            "build_dynamic_shape": False,
+            "build_dynamic_shape": True,
             "build_static_batch": True,
-            # Static shape engines are valid only at the (h,w) they were
-            # built for. Pass the actual runtime dims so the engine
-            # matches what inference will request.
+            # opt point — TRT's tactic selection is centered here.
             "opt_image_height": image_height,
             "opt_image_width": image_width,
+            # Min/max bounds for the dynamic shape envelope.
+            "min_image_resolution": min_image_resolution,
+            "max_image_resolution": max_image_resolution,
         },
     )
     import shutil
