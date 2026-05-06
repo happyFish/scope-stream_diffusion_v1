@@ -47,6 +47,7 @@ class EngineBuilder:
         force_engine_build: bool = False,
         force_onnx_export: bool = False,
         force_onnx_optimize: bool = False,
+        use_external_data: bool = False,
     ):
         if not force_onnx_export and os.path.exists(onnx_path):
             print(f"Found cached model: {onnx_path}")
@@ -58,7 +59,7 @@ class EngineBuilder:
                     self.network,
                     self.controlnet_model
                 )
-                
+
             export_onnx(
                 self.network,
                 onnx_path=onnx_path,
@@ -67,6 +68,7 @@ class EngineBuilder:
                 opt_image_width=opt_image_width,
                 opt_batch_size=opt_batch_size,
                 onnx_opset=onnx_opset,
+                use_external_data=use_external_data,
             )
             del self.network
             gc.collect()

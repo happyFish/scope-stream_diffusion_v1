@@ -398,7 +398,12 @@ class StreamDiffusionPipeline(Pipeline):
         cache_state.cn_adapters[mode] = adapter
         print(f"[TRT] ControlNet engine active ({mode}): {engine_path}", flush=True)
 
-    def _ensure_trt_unet(self, controlnet_mode: str = "none") -> None:
+    def _ensure_trt_unet(
+        self,
+        controlnet_mode: str = "none",
+        image_height: int | None = None,
+        image_width: int | None = None,
+    ) -> None:
         """Build TRT engine for the UNet and swap self.unet to the adapter.
 
         Two variants depending on controlnet_mode:
@@ -408,6 +413,12 @@ class StreamDiffusionPipeline(Pipeline):
             actually reaches the UNet's inner blocks. Without this, the
             residuals get silently dropped and ControlNet conditioning has
             no effect on the output.
+
+        ``image_height`` / ``image_width`` should be the runtime spatial
+        dims for this build. Falls back to ``self.height`` / ``self.width``
+        when omitted, but caller should pass them explicitly because
+        ``_prepare_runtime_state`` (which sets ``self.{height,width}``)
+        normally runs *after* this method.
 
         Engines are cached separately on disk because they have different
         signatures. Switching modes mid-process may trigger a rebuild.
@@ -423,7 +434,9 @@ class StreamDiffusionPipeline(Pipeline):
                 f"(had={self._trt_unet_has_controlnet}, want={want_control}); rebuilding"
             )
 
-        signature = (self.model_id, int(self.height), int(self.width))
+        eff_h = int(image_height if image_height is not None else self.height)
+        eff_w = int(image_width if image_width is not None else self.width)
+        signature = (self.model_id, eff_h, eff_w)
         cache_state, restored = _trt_cache.get_or_create(self._trt_cache_key, signature)
         if self._trt_cuda_stream is None and cache_state.cuda_stream is not None:
             self._trt_cuda_stream = cache_state.cuda_stream
@@ -465,8 +478,10 @@ class StreamDiffusionPipeline(Pipeline):
 
         from .trt_engines import (
             TRTUNetAdapter,
+            TRTUNetSDXLAdapter,
             TRTUNetWithControlAdapter,
             build_unet_engine,
+            build_unet_sdxl_engine,
             build_unet_with_control_engine,
             make_cuda_stream,
         )
@@ -476,6 +491,17 @@ class StreamDiffusionPipeline(Pipeline):
         cache_state.cuda_stream = self._trt_cuda_stream
 
         if want_control:
+            if self.sdxl:
+                # SDXL + ControlNet + TRT: not yet wired. The ControlNet
+                # path uses UNetWithControlInputs which assumes SD1.5
+                # signature (no text_embeds/time_ids). Falling through to
+                # eager keeps SDXL+ControlNet working until that variant
+                # gets the same SDXL aug-conditioning treatment as
+                # build_unet_sdxl_engine.
+                raise NotImplementedError(
+                    "SDXL + ControlNet + TRT not yet supported. Use "
+                    "acceleration_mode='none' with controlnet on SDXL models."
+                )
             print(
                 "[TRT] Preparing UNet+ctrl engine — first build takes 5-10 min, cached after",
                 flush=True,
@@ -483,8 +509,8 @@ class StreamDiffusionPipeline(Pipeline):
             engine_path = build_unet_with_control_engine(
                 self.pipe.unet,
                 model_id=self.model_id,
-                image_height=int(self.height),
-                image_width=int(self.width),
+                image_height=eff_h,
+                image_width=eff_w,
                 min_batch_size=1,
                 max_batch_size=4,
                 num_down_residuals=12,
@@ -496,6 +522,50 @@ class StreamDiffusionPipeline(Pipeline):
             cache_state.unet_adapter = self.unet
             cache_state.unet_has_controlnet = True
             print(f"[TRT] UNet+ctrl engine active: {engine_path}", flush=True)
+        elif self.sdxl:
+            print(
+                "[TRT] Preparing SDXL UNet engine — first build takes 5-10 min, cached after",
+                flush=True,
+            )
+            # TRT's builder TACTIC_DRAM allocator can race our resident
+            # pipeline allocations during engine build. Free what we can
+            # (VAE + text encoders, ~5 GB combined) without disturbing
+            # the UNet — the ONNX tracer needs it on GPU. Restore after
+            # the build completes.
+            print("[TRT] Moving VAE + text encoders to CPU during build", flush=True)
+            cpu_components = []
+            for attr in ("vae", "text_encoder", "text_encoder_2"):
+                comp = getattr(self.pipe, attr, None)
+                if comp is not None and hasattr(comp, "to"):
+                    try:
+                        comp.to("cpu")
+                        cpu_components.append((attr, comp))
+                    except Exception as e:
+                        print(f"[TRT] could not move {attr} to CPU: {e}", flush=True)
+            torch.cuda.empty_cache()
+            # batch=1 + static shape (set in build_unet_sdxl_engine) make
+            # TRT's tactic search bounded enough to fit on a 24 GB card.
+            # Engine is only valid at the (height, width, batch=1) profile
+            # it was built for; resolution changes will trigger a rebuild.
+            engine_path = build_unet_sdxl_engine(
+                self.pipe.unet,
+                model_id=self.model_id,
+                image_height=eff_h,
+                image_width=eff_w,
+                min_batch_size=1,
+                max_batch_size=1,
+            )
+            print("[TRT] Restoring VAE + text encoders to GPU", flush=True)
+            for attr, comp in cpu_components:
+                try:
+                    comp.to(self.device)
+                except Exception as e:
+                    print(f"[TRT] could not restore {attr} to {self.device}: {e}", flush=True)
+            self._trt_eager_unet = self.pipe.unet
+            self.unet = TRTUNetSDXLAdapter(engine_path, self._trt_cuda_stream)
+            cache_state.unet_adapter = self.unet
+            cache_state.unet_has_controlnet = False
+            print(f"[TRT] SDXL UNet engine active: {engine_path}", flush=True)
         else:
             print(
                 "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after",
@@ -504,8 +574,8 @@ class StreamDiffusionPipeline(Pipeline):
             engine_path = build_unet_engine(
                 self.pipe.unet,
                 model_id=self.model_id,
-                image_height=int(self.height),
-                image_width=int(self.width),
+                image_height=eff_h,
+                image_width=eff_w,
                 min_batch_size=1,
                 max_batch_size=4,
             )
@@ -1639,9 +1709,20 @@ class StreamDiffusionPipeline(Pipeline):
         # TRT engine swap — UNet always, ControlNet additionally when active.
         # Two separate engines (each <2 GB ONNX) instead of a single combined
         # graph that hits TRT's cask-convolution bug.
+        # Pass runtime dims explicitly: _prepare_runtime_state (which sets
+        # self.height/self.width and the latent dims) runs *after* this
+        # block. Static-shape SDXL engines need the real runtime dims at
+        # build time, otherwise they're sized for the __init__ defaults
+        # (512x512) and mismatch at inference. Setting self.{height,width}
+        # preemptively here is wrong — it'd block dims_changed in
+        # _prepare_runtime_state, leaving self.latent_{height,width} stale.
         if acceleration_mode == "trt":
             try:
-                self._ensure_trt_unet(controlnet_mode)
+                self._ensure_trt_unet(
+                    controlnet_mode,
+                    image_height=int(height),
+                    image_width=int(width),
+                )
             except Exception as e:
                 print(f"[TRT] UNet engine swap failed, falling back to eager: {e}")
                 import traceback

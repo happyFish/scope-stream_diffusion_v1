@@ -24,6 +24,7 @@ from .engine import (
     AutoencoderKLEngine,
     ControlNetEngine,
     UNet2DConditionModelEngine,
+    UNet2DConditionModelSDXLEngine,
     UNet2DConditionModelWithControlEngine,
 )
 from .models import (
@@ -33,6 +34,8 @@ from .models import (
     ControlNetExportWrapper,
     UNet,
     UNetExportWrapperWithControl,
+    UNetSDXL,
+    UNetSDXLExportWrapper,
     UNetWithControlInputs,
     VAEEncoder,
 )
@@ -109,14 +112,18 @@ __all__ = [
     "TorchVAEEncoder",
     "UNet",
     "UNet2DConditionModelEngine",
+    "UNet2DConditionModelSDXLEngine",
     "UNet2DConditionModelWithControlEngine",
     "UNetExportWrapperWithControl",
+    "UNetSDXL",
+    "UNetSDXLExportWrapper",
     "UNetWithControlInputs",
     "VAE",
     "VAEEncoder",
     "build_engine",
     "compile_controlnet",
     "compile_unet",
+    "compile_unet_sdxl",
     "compile_unet_with_control",
     "compile_vae_decoder",
     "compile_vae_encoder",
@@ -124,6 +131,41 @@ __all__ = [
     "export_onnx",
     "optimize_onnx",
 ]
+
+
+def compile_unet_sdxl(
+    unet: UNet2DConditionModel,
+    model_data: BaseModel,
+    onnx_path: str,
+    onnx_opt_path: str,  # noqa: ARG001 — kept for API symmetry; SDXL skips the polygraphy optimizer
+    engine_path: str,
+    opt_batch_size: int = 1,
+    engine_build_options: dict = {},
+):
+    """Compile an SDXL UNet to TRT — wraps text_embeds/time_ids as positional inputs.
+
+    Differs from `compile_unet` in one important way: **the polygraphy
+    ONNX optimization pass is skipped**. SDXL's UNet exports to a ~5 GB
+    ONNX file, and the polygraphy `optimize_onnx` step runs onnxruntime
+    shape-inference + Unsqueeze elimination passes that load the entire
+    graph into RAM with ~3-5× overhead — peaks at 20-25 GB and OOMs on
+    a 32 GB host. TensorRT's builder does its own graph optimization
+    during engine construction, so the pre-pass is double-work anyway.
+
+    Mechanism: pass the same path for both raw and "optimized" ONNX.
+    After export the file exists at `onnx_opt_path`, so the EngineBuilder
+    skips the optimize step and feeds the raw ONNX directly to TRT.
+    """
+    wrapped = UNetSDXLExportWrapper(unet).to(
+        torch.device("cuda"), dtype=torch.float16
+    ).eval()
+    builder = EngineBuilder(model_data, wrapped, device=torch.device("cuda"))
+    builder.build(
+        onnx_path, onnx_path, engine_path,  # same path twice: skip polygraphy optimizer
+        opt_batch_size=opt_batch_size,
+        use_external_data=True,  # SDXL UNet fp16 is ~2.6 GB → must use external-data format
+        **engine_build_options,
+    )
 
 
 def compile_unet_with_control(

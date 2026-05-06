@@ -369,6 +369,133 @@ def build_unet_engine(
     return engine_path
 
 
+def build_unet_sdxl_engine(
+    unet: UNet2DConditionModel,
+    *,
+    model_id: str,
+    image_height: int = 1024,
+    image_width: int = 1024,
+    min_batch_size: int = 1,
+    max_batch_size: int = 4,
+) -> Path:
+    """Build (or reuse) a TRT engine for an SDXL UNet.
+
+    Differs from `build_unet_engine` only in the I/O spec — adds
+    `text_embeds` and `time_ids` as engine inputs so SDXL's `get_aug_embed`
+    has the kwargs it expects. Without these the ONNX export crashes with
+    `TypeError: argument of type 'NoneType' is not iterable`.
+    """
+    from ._trt import UNetSDXL, compile_unet_sdxl, create_onnx_path
+
+    suffix = f"unet_sdxl_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
+    cache_dir = _model_cache_dir(model_id, suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "unet_sdxl.engine"
+
+    if engine_path.exists():
+        logger.info(f"[TRT] Reusing cached SDXL UNet engine: {engine_path}")
+        return engine_path
+
+    logger.info(f"[TRT] Building SDXL UNet engine -> {engine_path} (5-10 min on first build)")
+
+    unet_model = UNetSDXL(
+        fp16=True,
+        device=str(unet.device) if unet.device.type != "meta" else "cuda",
+        max_batch_size=max_batch_size,
+        min_batch_size=min_batch_size,
+        embedding_dim=unet.config.cross_attention_dim,
+        unet_dim=unet.config.in_channels,
+    )
+    # SDXL UNet build is memory-heavy; locking to static shape and static
+    # batch keeps TRT's tactic exploration bounded and the build fits in
+    # VRAM. Loses dynamic-shape flexibility (engine only valid at one
+    # resolution) but unblocks getting an engine produced at all. Dynamic
+    # shapes are a follow-up once the static path is verified.
+    compile_unet_sdxl(
+        unet, unet_model,
+        str(create_onnx_path("unet_sdxl", str(onnx_dir), opt=False)),
+        str(create_onnx_path("unet_sdxl", str(onnx_dir), opt=True)),
+        str(engine_path),
+        opt_batch_size=min_batch_size,
+        engine_build_options={
+            "build_dynamic_shape": False,
+            "build_static_batch": True,
+            # Static shape engines are valid only at the (h,w) they were
+            # built for. Pass the actual runtime dims so the engine
+            # matches what inference will request.
+            "opt_image_height": image_height,
+            "opt_image_width": image_width,
+        },
+    )
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    logger.info(f"[TRT] SDXL UNet engine built: {engine_path}")
+    return engine_path
+
+
+class TRTUNetSDXLAdapter:
+    """Drop-in for diffusers SDXL UNet — accepts added_cond_kwargs."""
+
+    def __init__(self, engine_path: Path, cuda_stream, *, use_cuda_graph: bool = False):
+        from ._trt import UNet2DConditionModelSDXLEngine
+        self.engine = UNet2DConditionModelSDXLEngine(
+            str(engine_path), cuda_stream, use_cuda_graph=use_cuda_graph,
+        )
+        self._use_cuda_graph = use_cuda_graph
+        self.config = _ConfigShim(sdxl=True)
+        # SDXL pipelines read `unet.add_embedding.linear_1.in_features` to
+        # size the add_time_ids tensor (must equal the original UNet's
+        # projection_class_embeddings_input_dim — 2816 for stock SDXL =
+        # 1280 text_embeds + 6 * 256 addition_time_embed_dim).
+        class _AddEmbeddingShim:
+            class _Linear1Shim:
+                in_features = 2816
+            linear_1 = _Linear1Shim()
+        self.add_embedding = _AddEmbeddingShim()
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        added_cond_kwargs: dict | None = None,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+
+        if (
+            added_cond_kwargs is None
+            or "text_embeds" not in added_cond_kwargs
+            or "time_ids" not in added_cond_kwargs
+        ):
+            raise RuntimeError(
+                "TRTUNetSDXLAdapter requires added_cond_kwargs with 'text_embeds' and 'time_ids'."
+            )
+
+        out = self.engine(
+            latent_model_input=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            text_embeds=added_cond_kwargs["text_embeds"],
+            time_ids=added_cond_kwargs["time_ids"],
+        )
+        if return_dict:
+            return out
+        return (out.sample,)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+
 class TRTUNetAdapter:
     """Thin wrapper for the vendored UNet engine.
 
@@ -435,13 +562,23 @@ class TRTUNetAdapter:
 
 
 class _ConfigShim:
-    """Diffusers config object surface — read by pipeline._prepare_runtime_state."""
+    """Diffusers config object surface — read by pipeline._prepare_runtime_state.
 
-    def __init__(self):
-        self.addition_time_embed_dim = None
+    Defaults match SD 1.5/2.1: addition_time_embed_dim=None (no aug
+    conditioning), cross_attention_dim=1024. Pass `sdxl=True` for SDXL
+    where the pipeline reads addition_time_embed_dim to size add_time_ids
+    and cross_attention_dim for the encoder hidden state.
+    """
+
+    def __init__(self, sdxl: bool = False):
+        if sdxl:
+            self.addition_time_embed_dim = 256  # SDXL standard
+            self.cross_attention_dim = 2048
+        else:
+            self.addition_time_embed_dim = None
+            self.cross_attention_dim = 1024
         self.in_channels = 4
         self.out_channels = 4
-        self.cross_attention_dim = 1024
 
 
 def build_taesd_engines(

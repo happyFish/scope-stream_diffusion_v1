@@ -409,12 +409,18 @@ def export_onnx(
     opt_image_width: int,
     opt_batch_size: int,
     onnx_opset: int,
+    use_external_data: bool = False,
 ):
     with torch.inference_mode(), torch.autocast("cuda"):
         inputs = model_data.get_sample_input(opt_batch_size, opt_image_height, opt_image_width)
         print('exporting onnx')
         print(model_data.get_input_names())
         print(model_data.get_dynamic_axes())
+        # use_external_data: SDXL UNet fp16 is ~2.6 GB, exceeding protobuf's
+        # 2 GB single-message limit. Without external-data format, the export
+        # produces malformed ONNX that TRT's parser rejects with
+        # `Invalid Engine`. SD 1.5 fits in 2 GB so we leave the default off
+        # for that path to keep the existing single-file cache layout.
         torch.onnx.export(
             model,
             inputs,
@@ -428,10 +434,53 @@ def export_onnx(
             dynamo=False,  # force legacy trace-based exporter — dynamo path
             # produces ONNX with op variants that polygraphy's version_converter
             # can't migrate (e.g. Resize). Legacy is what prism was tested on.
+            external_data=use_external_data,  # torch 2.9+ name (was use_external_data_format)
         )
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
+    if use_external_data:
+        # PyTorch's exporter writes one external file per tensor with only a
+        # `location` field — no explicit `offset` / `length`. Some tensors
+        # then trip TRT's parser:
+        #   [E] WeightsContextMemoryMap.cpp:124: Failed to open file: ...
+        # Consolidate into a single weights.bin with explicit offsets so
+        # TRT's mmap path sees the canonical layout. Bonus: cache dir goes
+        # from ~1500 files to 2.
+        import os, shutil
+        onnx_dir = os.path.dirname(onnx_path)
+        weights_name = os.path.basename(onnx_path) + ".weights"
+        m = onnx.load(onnx_path, load_external_data=True)
+        # Stage rewrite into a sibling temp dir so we can clear the original
+        # sidecars cleanly without colliding with the in-progress write.
+        staging = os.path.join(onnx_dir, "_consolidate_staging")
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        os.makedirs(staging)
+        staged_onnx = os.path.join(staging, os.path.basename(onnx_path))
+        onnx.save_model(
+            m, staged_onnx,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=weights_name,
+            size_threshold=1024,
+            convert_attribute=False,
+        )
+        # Remove the per-tensor sidecar files (everything in onnx_dir except
+        # the master .onnx and the new weights file we're about to move in).
+        for entry in os.listdir(onnx_dir):
+            full = os.path.join(onnx_dir, entry)
+            if full == staging or full == onnx_path:
+                continue
+            if os.path.isfile(full):
+                os.unlink(full)
+        # Move staged master + weights into place, then drop staging.
+        os.replace(staged_onnx, onnx_path)
+        os.replace(os.path.join(staging, weights_name), os.path.join(onnx_dir, weights_name))
+        shutil.rmtree(staging)
+        del m
+        gc.collect()
 
 
 def optimize_onnx(
