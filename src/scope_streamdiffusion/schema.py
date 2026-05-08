@@ -105,16 +105,18 @@ class StreamDiffusionConfig(BasePipelineConfig):
         description=(
             "TRT-compile UNet (and ControlNet on SD 1.5) for 2-8x denoising "
             "speedup. First build per model takes 5-10 min and caches to "
-            "~/.cache/scope-streamdiffusion-trt/. Set at session start; "
-            "changing requires pipeline reload. SD 1.5 engines support "
-            "dynamic resolution 256-1024 and batch 1-4. SDXL engines "
-            "(sdxl-turbo, dmd2-sdxl-1step) support dynamic resolution "
-            "512-1024 with static batch=1 — different envelope to fit a "
-            "24 GB VRAM build budget. SDXL + ControlNet + TRT is not yet "
-            "supported (raises NotImplementedError); use acceleration='none' "
-            "with controlnet on SDXL until that lands."
+            "~/.cache/scope-streamdiffusion-trt/. Hot-swappable at runtime: "
+            "toggling restores cached engines from process-scope cache "
+            "(instant) or builds them on first activation (stalls the "
+            "stream). SD 1.5 engines support dynamic resolution 256-1024 "
+            "and batch 1-4. SDXL engines (sdxl-turbo, dmd2-sdxl-1step) "
+            "support dynamic resolution 512-1024 with static batch=1 — "
+            "different envelope to fit a 24 GB VRAM build budget. SDXL + "
+            "ControlNet + TRT is not yet supported (raises "
+            "NotImplementedError); use acceleration_mode='none' with "
+            "controlnet on SDXL until that lands."
         ),
-        #json_schema_extra=ui_field_config(order=2, label="Acceleration"),
+        json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
 
     use_taesd: bool = Field(
@@ -223,6 +225,19 @@ class StreamDiffusionConfig(BasePipelineConfig):
         le=2147483647,
         description="Random seed for generation",
         json_schema_extra=ui_field_config(order=13, label="Seed"),
+    )
+
+    seed_transition_steps: int = Field(
+        default=0,
+        ge=0,
+        le=240,
+        description=(
+            "Lerp the seed noise toward the new seed over N frames on each "
+            "seed change. 0 = hard cut. SDXL-Turbo and DMD2-1step have less "
+            "natural frame-to-frame correlation than SD-Turbo; this gives a "
+            "deterministic settle independent of the model."
+        ),
+        json_schema_extra=ui_field_config(order=14, label="Seed Transition Steps"),
     )
 
     # ========================================

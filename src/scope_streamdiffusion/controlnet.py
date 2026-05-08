@@ -85,6 +85,28 @@ class ControlNetHandler:
         self.input: Optional[torch.Tensor] = None
         self.scale: float = 1.0
 
+    def release(self) -> None:
+        """Drop all GPU-resident models and tensors held by this handler.
+
+        Call before swapping the diffusion model — otherwise SD1.5 ControlNets,
+        depth-anything, and scribble weights stay resident across the swap and
+        contend with the new model's allocation. Caller is expected to run
+        ``torch.cuda.empty_cache()`` after this returns.
+        """
+        self._controlnet_cache.clear()
+        self._depth_model = None
+        self._depth_hidden_state = None
+        self._last_depth_shape = None
+        self._depth_min_ema = None
+        self._depth_max_ema = None
+        self._prev_depth_input = None
+        self._scribble_model = None
+        self._prev_scribble_input = None
+        self._depth_norm_mean = None
+        self._depth_norm_std = None
+        self.model = None
+        self.input = None
+
     def update(
         self,
         mode: str,

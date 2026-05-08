@@ -113,33 +113,30 @@ class StreamDiffusionPipeline(Pipeline):
 
         # The schema's field is ``model_id_or_path``. Scope's pipeline_manager
         # merges schema defaults into the init kwargs by their declared name,
-        # so we have to accept that spelling — accepting only ``model_id``
-        # silently drops the user's selection and reloads the default every
-        # time. Resolve in order: explicit model_id > model_id_or_path > default.
-        model_id = model_id or model_id_or_path or "stabilityai/sd-turbo"
-
-        # Load the base model
-        print(f"Loading model: {model_id}")
+        # so what we see at __init__ is the *schema default*, not the user's
+        # UI selection — that only arrives via runtime kwargs/config on the
+        # first __call__. To avoid a spurious "load SD-Turbo, then immediately
+        # swap to the user's pick" on every startup, defer the actual model
+        # load to ``_ensure_pipe_loaded`` (called from __call__ once we have
+        # the runtime selection). The init-time arg is just a tentative
+        # default in case nothing more authoritative shows up at runtime.
+        config_model = getattr(self.config, "model_id_or_path", None) if self.config else None
+        model_id = model_id or config_model or model_id_or_path or "stabilityai/sd-turbo"
         self.model_id = model_id
         self._timesteps_override = MODEL_PRESETS.get(model_id, {}).get("timesteps_override")
-        self.pipe = self._load_model(model_id)
-        print(f"Model loaded: {self.pipe.__class__.__name__}")
+        print(f"[StreamDiffusion] Tentative model: {model_id} (load deferred to first __call__)")
 
-        self.sdxl: bool = type(self.pipe) is StableDiffusionXLPipeline
-
-        # SDXL's default VAE overflows in fp16 and decodes NaN. Swap to the
-        # community fp16-fix VAE so the full-quality decode path works without
-        # forcing TAESD.
-        if self.sdxl and self.dtype == torch.float16:
-            self._install_sdxl_fp16_vae()
-
-        # Model components
-        self.text_encoder = self.pipe.text_encoder
-        self.unet = self.pipe.unet
-        self.vae = self.pipe.vae
-        self._full_vae = self.vae  # keep reference for toggling
+        # Model-dependent attrs are populated by ``_ensure_pipe_loaded``.
+        self.pipe = None
+        self.sdxl: bool = False
+        self.text_encoder = None
+        self.unet = None
+        self.vae = None
+        self._full_vae = None  # populated on load
         self._taesd_vae = None
         self._using_taesd = False
+        self.scheduler = None
+        self.image_processor = None
 
         # legacy torch.compile flag — kept so other code paths that read
         # `_unet_compiled` (e.g. _ensure_trt_unet's "restore eager" branch)
@@ -163,6 +160,10 @@ class StreamDiffusionPipeline(Pipeline):
         self._trt_eager_controlnets: dict[str, Any] = {}  # mode -> diffusers ControlNetModel (fallback)
         self._trt_cuda_stream = None
         self._trt_eager_unet = None  # original; kept for fallback
+        # (height, width, controlnet_mode, use_taesd) of the last _setup_trt call.
+        # __call__ compares the current values against this and re-runs setup
+        # only on real divergence — otherwise the per-frame TRT block is a no-op.
+        self._trt_setup_signature: tuple | None = None
 
         # Read acceleration_mode at init from schema defaults / load_params.
         # The runtime kwargs path is unreliable because moth's 30fps param flood
@@ -182,15 +183,8 @@ class StreamDiffusionPipeline(Pipeline):
         self._node_id: str | None = kwargs.get("node_id")
         self._trt_cache_key: str = _trt_cache.cache_key(self._node_id, model_id)
 
-        # Setup scheduler
-        self.scheduler: LCMScheduler = LCMScheduler.from_config(
-            self.pipe.scheduler.config
-        )
-
-        # Setup image processor
-        self.image_processor: VaeImageProcessor = VaeImageProcessor(
-            self.pipe.vae_scale_factor
-        )
+        # Scheduler / image_processor are model-dependent — populated by
+        # ``_ensure_pipe_loaded`` on the first __call__.
 
         # Setup embedding blender for prompt weighting and interpolation
         self.embedding_blender = EmbeddingBlender(
@@ -245,10 +239,60 @@ class StreamDiffusionPipeline(Pipeline):
         self._pooled_target: torch.Tensor | None = None
         self._transition_total_steps: int = 0
 
+        # Seed transition state — when seed_transition_steps > 0, lerp
+        # `init_noise` from the previous seed's tensor to the new seed's
+        # tensor over N frames instead of hard-swapping. SDXL-Turbo /
+        # DMD2-1step have weaker stock_noise feedback than SD-Turbo, so
+        # without this seed changes read as hard cuts.
+        self._seed_transition_source: torch.Tensor | None = None
+        self._seed_transition_target: torch.Tensor | None = None
+        self._seed_transition_progress: int = 0
+        self._seed_transition_total: int = 0
+
         # Mode-transition tracking — detect video↔text switches without a pipeline reload
         self._last_mode: str | None = None
 
-        print("StreamDiffusion pipeline initialized")
+        # TRT setup is deferred along with the model load — engines need
+        # ``self.pipe.unet`` to exist. ``_ensure_pipe_loaded`` runs
+        # ``_setup_trt`` immediately after loading when acceleration_mode
+        # is 'trt', so the first frame still pays the build cost up-front
+        # rather than mid-stream.
+
+        print("StreamDiffusion pipeline initialized (model load deferred)")
+
+    def _ensure_pipe_loaded(self, model_id: str) -> None:
+        """Load the diffusion model and populate model-dependent state.
+
+        Called once from the first ``__call__`` with the user's actual
+        ``model_id_or_path`` from runtime kwargs/config. Doing the load here
+        instead of in ``__init__`` avoids a wasted "load schema default,
+        immediately swap to user's pick" cycle, since Scope's
+        pipeline_manager only forwards schema defaults at __init__ time.
+        Subsequent runtime model changes go through ``_swap_model``.
+        """
+        if self.pipe is not None:
+            return
+        print(f"[StreamDiffusion] Loading model: {model_id}")
+        self.model_id = model_id
+        self._timesteps_override = MODEL_PRESETS.get(model_id, {}).get("timesteps_override")
+        self._trt_cache_key = _trt_cache.cache_key(self._node_id, model_id)
+        self.pipe = self._load_model(model_id)
+        print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
+
+        self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
+        if self.sdxl and self.dtype == torch.float16:
+            self._install_sdxl_fp16_vae()
+
+        self.text_encoder = self.pipe.text_encoder
+        self.unet = self.pipe.unet
+        self.vae = self.pipe.vae
+        self._full_vae = self.vae
+        self._using_taesd = False
+        self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+        self.image_processor = VaeImageProcessor(self.pipe.vae_scale_factor)
+
+        if self._acceleration_mode == "trt":
+            self._setup_trt(**self._trt_setup_args_from_config())
 
     def _ensure_trt_taesd(self) -> None:
         """Build TRT engines for the TAESD encoder + decoder, swap self.vae.
@@ -586,6 +630,139 @@ class StreamDiffusionPipeline(Pipeline):
             cache_state.unet_has_controlnet = False
             print(f"[TRT] UNet engine active: {engine_path}", flush=True)
 
+    def _setup_trt(
+        self,
+        *,
+        height: int,
+        width: int,
+        controlnet_mode: str,
+        use_taesd: bool,
+    ) -> None:
+        """Build or attach TRT engines for the current model.
+
+        Called at load time (``__init__`` and ``_swap_model``) so the first
+        frame doesn't stall on a 5-10 minute compile, and again from
+        ``__call__`` only when ``(height, width, controlnet_mode, use_taesd)``
+        diverges from the last setup. The inner ``_ensure_trt_*`` methods
+        short-circuit when nothing needs to change.
+        """
+        if self._acceleration_mode != "trt":
+            return
+        try:
+            self._ensure_trt_unet(
+                controlnet_mode,
+                image_height=int(height),
+                image_width=int(width),
+            )
+        except Exception as e:
+            print(f"[TRT] UNet engine swap failed, falling back to eager: {e}")
+            import traceback
+            traceback.print_exc()
+            if self._trt_eager_unet is not None:
+                self.unet = self._trt_eager_unet
+        if controlnet_mode in ("depth", "scribble"):
+            try:
+                self._ensure_trt_controlnet(controlnet_mode)
+            except Exception as e:
+                print(
+                    f"[TRT] ControlNet engine swap failed for {controlnet_mode}, using eager: {e}"
+                )
+                import traceback
+                traceback.print_exc()
+        if use_taesd:
+            try:
+                self._ensure_trt_taesd()
+            except Exception as e:
+                print(f"[TRT] TAESD engine swap failed, using eager: {e}")
+                import traceback
+                traceback.print_exc()
+        self._trt_setup_signature = (
+            int(height),
+            int(width),
+            controlnet_mode,
+            bool(use_taesd),
+        )
+
+    def _reset_trt_state(self, new_model_id: str) -> None:
+        """Invalidate TRT sticky state so the next ``_setup_trt`` rebuilds.
+
+        Called from ``_swap_model`` before loading the new model. Without
+        this, the sticky ``_trt_unet_built`` / ``_trt_taesd_built`` flags
+        cause subsequent ``_ensure_trt_*`` calls to short-circuit and the
+        new model runs eager regardless of ``acceleration_mode``.
+        """
+        # Drop the module-scope cache entry for the previous model. Without
+        # this its ``unet_adapter`` / ``cn_adapters`` / ``taesd_adapter``
+        # references stay live in ``_trt_cache._CACHE`` and pin engine
+        # memory across the swap — direct cause of OOM on a 24 GB card
+        # when going SD1.5 → SDXL with TRT on.
+        old_key = getattr(self, "_trt_cache_key", None)
+        if old_key:
+            _trt_cache.clear(old_key)
+        self._trt_unet_built = False
+        self._trt_unet_has_controlnet = False
+        self._trt_taesd_built = False
+        self._trt_eager_unet = None
+        self._trt_eager_taesd = None
+        self._trt_cn_built_modes.clear()
+        self._trt_cn_engines.clear()
+        self._trt_eager_controlnets.clear()
+        self._trt_cache_key = _trt_cache.cache_key(self._node_id, new_model_id)
+        self._trt_setup_signature = None
+
+    def _set_acceleration_mode(self, mode: str) -> None:
+        """Swap between TRT-accelerated and eager modules at runtime.
+
+        TRT engines themselves are immutable after build, but the choice of
+        which UNet / ControlNet / TAESD module ``self.*`` points at *can* be
+        flipped per frame. Cached adapters (in ``_trt_cache._CACHE`` and on
+        the instance) stay alive across the swap so toggling back to 'trt'
+        is instant after the first build.
+        """
+        if mode not in ("none", "trt") or mode == self._acceleration_mode:
+            return
+        print(
+            f"[StreamDiffusion] acceleration_mode swap: "
+            f"{self._acceleration_mode} -> {mode}"
+        )
+        if mode == "none":
+            self._deactivate_trt()
+            self._acceleration_mode = "none"
+        else:
+            self._acceleration_mode = "trt"
+            self._setup_trt(**self._trt_setup_args_from_config())
+
+    def _deactivate_trt(self) -> None:
+        """Restore eager UNet / ControlNet / TAESD; keep adapters cached.
+
+        Resets the sticky ``_trt_*_built`` flags so a future ``_setup_trt``
+        re-enters the cache-restore path and re-attaches the same adapters
+        without rebuilding.
+        """
+        if self._trt_eager_unet is not None and self.unet is not self._trt_eager_unet:
+            self.unet = self._trt_eager_unet
+        if self._trt_eager_taesd is not None:
+            self._taesd_vae = self._trt_eager_taesd
+            if self._using_taesd:
+                self.vae = self._taesd_vae
+        if self._cn.model is not None:
+            self.controlnet = self._cn.model
+        self._trt_unet_built = False
+        self._trt_unet_has_controlnet = False
+        self._trt_taesd_built = False
+        self._trt_cn_built_modes.clear()
+        self._trt_setup_signature = None
+
+    def _trt_setup_args_from_config(self) -> dict:
+        """Resolve _setup_trt args from self.config, with schema-default fallbacks."""
+        cfg = self.config
+        return {
+            "height": int(getattr(cfg, "height", 512)) if cfg else 512,
+            "width": int(getattr(cfg, "width", 512)) if cfg else 512,
+            "controlnet_mode": getattr(cfg, "controlnet_mode", "none") if cfg else "none",
+            "use_taesd": bool(getattr(cfg, "use_taesd", True)) if cfg else True,
+        }
+
     def _load_model(self, model_id: str) -> DiffusionPipeline:
         """Load the diffusion model.
 
@@ -637,10 +814,17 @@ class StreamDiffusionPipeline(Pipeline):
         unet_swap = preset.get("unet_swap")
         if unet_swap is not None:
             from huggingface_hub import hf_hub_download
+            from huggingface_hub.utils import LocalEntryNotFoundError
 
             unet_repo, unet_file = unet_swap
-            print(f"[StreamDiffusion] Downloading distilled UNet: {unet_repo}/{unet_file}")
-            ckpt_path = hf_hub_download(unet_repo, unet_file)
+            # Probe the local cache first so we can log accurately. The unconditional
+            # "Downloading" print was misleading on every cached load.
+            try:
+                ckpt_path = hf_hub_download(unet_repo, unet_file, local_files_only=True)
+                print(f"[StreamDiffusion] Loading cached distilled UNet: {unet_repo}/{unet_file}")
+            except LocalEntryNotFoundError:
+                print(f"[StreamDiffusion] Downloading distilled UNet: {unet_repo}/{unet_file}")
+                ckpt_path = hf_hub_download(unet_repo, unet_file)
             # Distilled-UNet repos (DMD2, SDXL-Lightning, etc.) often ship
             # weights only — no config.json — because the architecture is
             # identical to the base UNet. Reuse the base pipeline's UNet
@@ -656,6 +840,74 @@ class StreamDiffusionPipeline(Pipeline):
 
         return pipe
 
+    def _release_pipe_state(self) -> None:
+        """Drop every GPU-resident reference owned by the pipeline.
+
+        Called from :meth:`_swap_model` before loading the new model.
+        Clears module references (``unet`` / ``vae`` / ``text_encoder`` /
+        any TRT adapter still pinned in ``self.unet``), per-step cached
+        tensors, prompt-embedding caches, and the ControlNet handler's
+        sub-models. Caller (``_swap_model``) is expected to have already
+        run :meth:`_reset_trt_state` so the cache-state-held adapter
+        references are gone too. Finishes with a ``gc.collect`` +
+        ``torch.cuda.empty_cache`` so the next allocation starts clean.
+        """
+        import gc
+
+        # Module references — these are the big-ticket allocations.
+        # self.unet may be a TRT adapter that owns engine memory; nulling
+        # it here is what actually releases the engine.
+        self.unet = None
+        self.vae = None
+        self.text_encoder = None
+        self._taesd_vae = None
+        self._full_vae = None
+        self.controlnet = None
+        self.controlnet_input = None
+        if hasattr(self, "_cn") and self._cn is not None:
+            self._cn.release()
+
+        # Cached per-step tensors.
+        for attr in (
+            "init_noise",
+            "stock_noise",
+            "x_t_latent_buffer",
+            "prev_image_result",
+            "prompt_embeds",
+            "add_text_embeds",
+            "add_time_ids",
+            "alpha_prod_t_sqrt",
+            "beta_prod_t_sqrt",
+            "c_skip",
+            "c_out",
+            "sub_timesteps_tensor",
+            "timesteps",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+
+        # Embedding / transition caches.
+        self._cached_base_embed = None
+        self._previous_prompt_embeddings = None
+        self._pooled_source = None
+        self._pooled_target = None
+        self._seed_transition_source = None
+        self._seed_transition_target = None
+        if hasattr(self, "embedding_blender"):
+            try:
+                self.embedding_blender.cancel_transition()
+            except Exception:
+                pass
+
+        # Drop the pipeline last so any of the above that aliased its
+        # submodules have already been nulled.
+        self.pipe = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
     def _swap_model(self, new_model_id: str) -> None:
         """Replace the loaded model in place.
 
@@ -667,15 +919,16 @@ class StreamDiffusionPipeline(Pipeline):
         swaps it. Stalls the frame loop while loading — same as a fresh load.
         """
         print(f"[StreamDiffusion] Swapping model: {self.model_id} -> {new_model_id}")
-        # Free the current model's GPU memory before bringing the next one in
-        # so we don't peak at 2x weights.
-        old = getattr(self, "pipe", None)
-        if old is not None:
-            del old
-        self.pipe = None
-        self._taesd_vae = None
-        self._full_vae = None
-        torch.cuda.empty_cache()
+        # Reset TRT sticky state for the new model. Without this the
+        # ``_trt_unet_built`` / ``_trt_taesd_built`` flags from the previous
+        # model cause the next ``_setup_trt`` to short-circuit, leaving the
+        # new model running eager regardless of acceleration_mode.
+        self._reset_trt_state(new_model_id)
+        # Tear down everything the old model holds on the GPU before loading
+        # the new one — without this we peak at 2x model weights + engines
+        # and OOM on large models (SDXL UNet alone is ~5 GB fp16, plus a
+        # 2 GB+ TRT engine, plus VAE / text encoders / cached tensors).
+        self._release_pipe_state()
 
         self.model_id = new_model_id
         self._timesteps_override = MODEL_PRESETS.get(new_model_id, {}).get("timesteps_override")
@@ -711,6 +964,11 @@ class StreamDiffusionPipeline(Pipeline):
                 self.embedding_blender.cancel_transition()
             except Exception:
                 pass
+        self._cancel_seed_transition()
+
+        # Build TRT engines for the new model now so the next frame doesn't stall.
+        if self._acceleration_mode == "trt":
+            self._setup_trt(**self._trt_setup_args_from_config())
 
     def _install_sdxl_fp16_vae(self) -> None:
         """Swap SDXL's default VAE for madebyollin/sdxl-vae-fp16-fix.
@@ -803,6 +1061,7 @@ class StreamDiffusionPipeline(Pipeline):
         do_add_noise: bool,
         transition: Optional[dict] = None,
         transition_steps: int = 0,
+        seed_transition_steps: int = 0,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         t_index_list: Optional[List[int]] = None,
     ):
@@ -861,14 +1120,21 @@ class StreamDiffusionPipeline(Pipeline):
         seed_changed = seed != self._last_seed
         shape_changed = noise_shape != self._noise_shape or dims_changed
 
-        if seed_changed:
+        if shape_changed:
+            # Different latent shape can't be lerped against the old buffer;
+            # hard-reset and cancel any in-flight seed transition.
             self.generator.manual_seed(seed)
             self._last_seed = seed
-
-        if seed_changed or shape_changed:
+            self._cancel_seed_transition()
             self.x_t_latent_buffer = None
             self._initialize_noise()
             self._noise_shape = noise_shape
+        elif seed_changed:
+            # Hard cut when seed_transition_steps == 0; multi-frame lerp otherwise.
+            self._setup_seed_transition(seed, seed_transition_steps)
+
+        # Advance any in-flight seed transition by one frame. No-op when idle.
+        self._advance_seed_transition()
 
         # --- Prompt embeddings & transitions ---
         # The key includes spatial dims for SDXL because add_time_ids depend on them.
@@ -1323,6 +1589,86 @@ class StreamDiffusionPipeline(Pipeline):
 
         self.stock_noise = torch.zeros_like(self.init_noise)
 
+    def _setup_seed_transition(self, new_seed: int, total_steps: int) -> None:
+        """Begin a multi-frame lerp from the current init_noise to the new seed.
+
+        Falls back to a hard cut (re-seed + regenerate immediately) when
+        ``total_steps <= 0`` or no prior ``init_noise`` exists. The first
+        frame after this runs at the source noise; subsequent frames lerp
+        toward the target via :meth:`_advance_seed_transition`.
+        """
+        self._cancel_seed_transition()
+        if total_steps <= 0 or self.init_noise is None:
+            self.generator.manual_seed(new_seed)
+            self._last_seed = new_seed
+            self.x_t_latent_buffer = None
+            self._initialize_noise()
+            return
+
+        self._seed_transition_source = self.init_noise.detach().clone()
+        self.generator.manual_seed(new_seed)
+        self._seed_transition_target = torch.randn(
+            self.init_noise.shape,
+            generator=self.generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._seed_transition_progress = 0
+        self._seed_transition_total = total_steps
+        self._last_seed = new_seed
+        # Match the hard-cut path's stock_noise reset so the StreamDiffusion
+        # feedback term doesn't carry the previous seed's accumulator.
+        self.stock_noise = torch.zeros_like(self.init_noise)
+        self.x_t_latent_buffer = None
+
+    @staticmethod
+    def _slerp_noise(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
+        """Spherical interpolation between two noise tensors.
+
+        Linear interpolation drops the variance of standard-normal noise to
+        ``(1-t)² + t²`` mid-blend (0.5 at t=0.5), which the diffusion model
+        renders as washed-out / blurry output. Slerp keeps the result on the
+        same hypersphere as the endpoints, preserving variance and producing
+        a perceptually smooth crossfade between scenes.
+        """
+        a_flat = a.flatten().float()
+        b_flat = b.flatten().float()
+        a_norm = a_flat.norm()
+        b_norm = b_flat.norm()
+        cos_omega = (a_flat @ b_flat) / (a_norm * b_norm + 1e-8)
+        cos_omega = cos_omega.clamp(-1.0, 1.0)
+        omega = torch.acos(cos_omega)
+        sin_omega = torch.sin(omega)
+        # Collinear endpoints — degenerate to lerp to avoid divide-by-zero.
+        if sin_omega.abs() < 1e-6:
+            return torch.lerp(a, b, t)
+        w_a = torch.sin((1.0 - t) * omega) / sin_omega
+        w_b = torch.sin(t * omega) / sin_omega
+        return (w_a * a + w_b * b).to(dtype=a.dtype)
+
+    def _advance_seed_transition(self) -> None:
+        """Slerp ``init_noise`` one step toward the target. No-op when idle."""
+        if self._seed_transition_total <= 0:
+            return
+        self._seed_transition_progress += 1
+        if self._seed_transition_progress >= self._seed_transition_total:
+            self.init_noise = self._seed_transition_target.clone()
+            self._cancel_seed_transition()
+            return
+        t = self._seed_transition_progress / self._seed_transition_total
+        self.init_noise = self._slerp_noise(
+            self._seed_transition_source,
+            self._seed_transition_target,
+            t,
+        )
+
+    def _cancel_seed_transition(self) -> None:
+        """Drop any in-flight seed transition without snapping init_noise."""
+        self._seed_transition_source = None
+        self._seed_transition_target = None
+        self._seed_transition_progress = 0
+        self._seed_transition_total = 0
+
     def _get_add_time_ids(
         self,
         original_size,
@@ -1625,12 +1971,16 @@ class StreamDiffusionPipeline(Pipeline):
             # Finally use default
             return default
 
-        # Hot-swap when the model selection changes at runtime. Scope routes
-        # model_id_or_path through setNodeParams (kwargs / config), not
-        # through pipeline/load — so this is the only spot where a UI-driven
-        # change actually takes effect.
-        requested_model = get_param("model_id_or_path", None)
-        if requested_model and requested_model != self.model_id:
+        # Resolve the user's model selection from runtime kwargs/config.
+        # On the first call the pipe isn't loaded yet — __init__ defers the
+        # load specifically so we can pick the *real* selection here instead
+        # of the schema default that pipeline_manager hands us at __init__.
+        # On subsequent calls a runtime change (UI swap) routes through
+        # _swap_model.
+        requested_model = get_param("model_id_or_path", None) or self.model_id
+        if self.pipe is None:
+            self._ensure_pipe_loaded(requested_model)
+        elif requested_model and requested_model != self.model_id:
             self._swap_model(requested_model)
 
         # Extract all parameters with config fallback
@@ -1645,6 +1995,7 @@ class StreamDiffusionPipeline(Pipeline):
         strength = get_param("strength", 0.9)
 
         seed = get_param("seed", 42)
+        seed_transition_steps = get_param("seed_transition_steps", 0)
         delta = get_param("delta", 1.0)
         width = get_param("width", 512)
         height = get_param("height", 512)
@@ -1665,8 +2016,14 @@ class StreamDiffusionPipeline(Pipeline):
         # at ~40 ms/call vs TAESD's ~5 ms. Big perf cliff if the param isn't
         # propagated from moth (e.g. queue-drop or absent from project file).
         use_taesd = get_param("use_taesd", True)
-        # acceleration_mode is locked at init (see __init__) — runtime updates
-        # don't change it because TRT engines can't be hot-swapped.
+        # acceleration_mode is hot-swappable: the engines themselves can't be
+        # rebuilt at runtime, but the module references (self.unet etc.) can
+        # flip between TRT adapters and eager modules. _set_acceleration_mode
+        # swaps; first 'trt' activation builds (slow), subsequent ones hit
+        # the cached adapters (instant).
+        requested_mode = get_param("acceleration_mode", self._acceleration_mode)
+        if requested_mode != self._acceleration_mode:
+            self._set_acceleration_mode(requested_mode)
         acceleration_mode = self._acceleration_mode
 
         # --- Safeguard: prevent invalid strength / num_inference_steps combos ---
@@ -1707,44 +2064,20 @@ class StreamDiffusionPipeline(Pipeline):
         self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
 
-        # TRT engine swap — UNet always, ControlNet additionally when active.
-        # Two separate engines (each <2 GB ONNX) instead of a single combined
-        # graph that hits TRT's cask-convolution bug.
-        # Pass runtime dims explicitly: _prepare_runtime_state (which sets
-        # self.height/self.width and the latent dims) runs *after* this
-        # block. Static-shape SDXL engines need the real runtime dims at
-        # build time, otherwise they're sized for the __init__ defaults
-        # (512x512) and mismatch at inference. Setting self.{height,width}
-        # preemptively here is wrong — it'd block dims_changed in
-        # _prepare_runtime_state, leaving self.latent_{height,width} stale.
+        # TRT engines are normally built at load time (in __init__ /
+        # _swap_model). This guard catches the residual cases where runtime
+        # values diverge from what was used at load — e.g. the user changes
+        # resolution, toggles controlnet on/off, or flips use_taesd in the
+        # UI. Fast no-op when nothing changed.
         if acceleration_mode == "trt":
-            try:
-                self._ensure_trt_unet(
-                    controlnet_mode,
-                    image_height=int(height),
-                    image_width=int(width),
+            sig = (int(height), int(width), controlnet_mode, bool(use_taesd))
+            if sig != self._trt_setup_signature:
+                self._setup_trt(
+                    height=int(height),
+                    width=int(width),
+                    controlnet_mode=controlnet_mode,
+                    use_taesd=bool(use_taesd),
                 )
-            except Exception as e:
-                print(f"[TRT] UNet engine swap failed, falling back to eager: {e}")
-                import traceback
-                traceback.print_exc()
-                if self._trt_eager_unet is not None:
-                    self.unet = self._trt_eager_unet
-            if controlnet_mode in ("depth", "scribble"):
-                try:
-                    self._ensure_trt_controlnet(controlnet_mode)
-                except Exception as e:
-                    print(f"[TRT] ControlNet engine swap failed for {controlnet_mode}, using eager: {e}")
-                    import traceback
-                    traceback.print_exc()
-            # TAESD TRT — saves ~3-5 ms vs eager TAESD (which is already fast)
-            if use_taesd:
-                try:
-                    self._ensure_trt_taesd()
-                except Exception as e:
-                    print(f"[TRT] TAESD engine swap failed, using eager: {e}")
-                    import traceback
-                    traceback.print_exc()
 
         self.controlnet_conditioning_scale = self._cn.scale
         # Extract transition (explicit transition overrides auto-transition)
@@ -1766,16 +2099,22 @@ class StreamDiffusionPipeline(Pipeline):
             do_add_noise=do_add_noise,
             transition=transition,
             transition_steps=transition_steps,
+            seed_transition_steps=seed_transition_steps,
         )
 
         frame = None
 
-        # Process input. Note: image_loopback must be opt-in. Falling back to
-        # `prev_image_result` whenever video is missing turns text mode into a
-        # recursive feedback loop (each frame uses the previous frame's
-        # output as input), which drifts to over-saturated/abstract patterns
-        # within a few frames.
-        if image_loopback and self.prev_image_result is not None:
+        # Process input. In text-only mode (no video stream) we fall back to
+        # the previous frame's output as input — the implicit-loopback path.
+        # This is what gives txt2img its iterative refinement: frame 1 is a
+        # cold t2i pass and frames 2+ are img2img on the previous output, so
+        # SD-Turbo's single-step recovery sharpens detail across frames.
+        # Removing the fallback (strict opt-in via image_loopback) loses the
+        # refinement and txt2img output stays at single-shot quality forever.
+        # The drift this can cause on long runs is the cost of admission.
+        if image_loopback or (
+            (video is None or len(video) == 0) and self.prev_image_result is not None
+        ):
             frame = self.prev_image_result
         elif video is not None and len(video) > 0:
             # Convert Scope tensor format to pipeline format
