@@ -16,10 +16,10 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
     retrieve_latents,
 )
 from scope.core.pipelines.interface import Pipeline, Requirements
-from scope.core.pipelines.blending import EmbeddingBlender, parse_transition_config
 
 from . import _trt_cache
 from .controlnet import ControlNetHandler
+from .prompt_encoder import PromptEncoder, normalize_prompts
 from .schema import StreamDiffusionConfig
 
 if TYPE_CHECKING:
@@ -199,15 +199,15 @@ class StreamDiffusionPipeline(Pipeline):
         # Scheduler / image_processor are model-dependent — populated by
         # ``_ensure_pipe_loaded`` on the first __call__.
 
-        # Setup embedding blender for prompt weighting and interpolation
-        self.embedding_blender = EmbeddingBlender(
-            device=self.device,
-            dtype=self.dtype,
-        )
+        # Prompt encoding (text-encode, blending, transitions, negative
+        # subtraction) lives on its own helper. ``attach()`` wires it to
+        # the live pipe at load time and on every model swap. Inference
+        # reads ``self.prompts.prompt_embeds`` / ``add_text_embeds`` /
+        # ``add_time_ids`` directly.
+        self.prompts = PromptEncoder(self.device, self.dtype)
 
         # State that will be set during runtime
         self.generator = torch.Generator(device=self.device)
-        self._previous_prompt_embeddings = None
         self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.inference_time_ema = 0
@@ -241,16 +241,6 @@ class StreamDiffusionPipeline(Pipeline):
         )
         self._last_seed: int | None = None
         self._noise_shape: tuple | None = None  # (batch_size, latent_h, latent_w)
-        self._prompts_key: tuple | None = None
-        self._cached_base_embed: torch.Tensor | None = None  # (1, seq_len, hidden_dim)
-
-        # Transition state — the main embedding queue lives inside
-        # EmbeddingBlender; the pooled embedding (SDXL only) is interpolated
-        # linearly in lockstep here so `add_text_embeds` tracks the morph.
-        self._last_transition_id: str | None = None
-        self._pooled_source: torch.Tensor | None = None
-        self._pooled_target: torch.Tensor | None = None
-        self._transition_total_steps: int = 0
 
         # Seed transition state — when seed_transition_steps > 0, lerp
         # `init_noise` from the previous seed's tensor to the new seed's
@@ -261,16 +251,6 @@ class StreamDiffusionPipeline(Pipeline):
         self._seed_transition_target: torch.Tensor | None = None
         self._seed_transition_progress: int = 0
         self._seed_transition_total: int = 0
-
-        # Negative-prompt embedding cache. We don't run a second UNet pass
-        # for CFG (DMD2 / SD-Turbo are CFG-distilled), so "negative prompt"
-        # here means embedding-space subtraction: prompt_embeds -= scale *
-        # neg_embed before the single UNet call. Cache the encoded negative
-        # so we don't re-encode every frame; invalidate when the text or
-        # the model changes.
-        self._cached_negative_text: str | None = None
-        self._cached_negative_embed: torch.Tensor | None = None
-        self._cached_negative_pooled: torch.Tensor | None = None
 
         # Mode-transition tracking — detect video↔text switches without a pipeline reload
         self._last_mode: str | None = None
@@ -315,6 +295,7 @@ class StreamDiffusionPipeline(Pipeline):
         self._using_taesd = False
         self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.image_processor = VaeImageProcessor(self.pipe.vae_scale_factor)
+        self.prompts.attach(self.pipe, self.sdxl)
 
         if self._acceleration_mode == "trt":
             self._setup_trt(**self._trt_setup_args_from_config())
@@ -898,9 +879,6 @@ class StreamDiffusionPipeline(Pipeline):
             "stock_noise",
             "x_t_latent_buffer",
             "prev_image_result",
-            "prompt_embeds",
-            "add_text_embeds",
-            "add_time_ids",
             "alpha_prod_t_sqrt",
             "beta_prod_t_sqrt",
             "c_skip",
@@ -911,22 +889,14 @@ class StreamDiffusionPipeline(Pipeline):
             if hasattr(self, attr):
                 setattr(self, attr, None)
 
-        # Embedding / transition caches.
-        self._cached_base_embed = None
-        self._previous_prompt_embeddings = None
-        self._pooled_source = None
-        self._pooled_target = None
+        # Reset prompt-encoder caches (text-encoder-specific; the new
+        # model will have a different text encoder).
+        if hasattr(self, "prompts"):
+            self.prompts.reset_caches()
+
+        # Seed-transition state.
         self._seed_transition_source = None
         self._seed_transition_target = None
-        # Negative-embed cache is text-encoder-specific; swap invalidates it.
-        self._cached_negative_text = None
-        self._cached_negative_embed = None
-        self._cached_negative_pooled = None
-        if hasattr(self, "embedding_blender"):
-            try:
-                self.embedding_blender.cancel_transition()
-            except Exception:
-                pass
 
         # Drop the pipeline last so any of the above that aliased its
         # submodules have already been nulled.
@@ -976,28 +946,14 @@ class StreamDiffusionPipeline(Pipeline):
         self._using_taesd = False
         self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.image_processor = VaeImageProcessor(self.pipe.vae_scale_factor)
+        self.prompts.attach(self.pipe, self.sdxl)
 
-        # Invalidate runtime caches so the next __call__ rebuilds prompt
-        # embeddings, timestep schedule, and noise buffers against the new
-        # model — text encoder + UNet config differ between SD1.5 and SDXL.
+        # Invalidate runtime caches so the next __call__ rebuilds the
+        # timestep schedule and noise buffers against the new model.
+        # Prompt-encoder caches are reset by ``prompts.attach()`` above.
         self._schedule_key = None
         self._noise_shape = None
-        self._prompts_key = None
-        self._cached_base_embed = None
-        self._previous_prompt_embeddings = None
-        self._cached_negative_text = None
-        self._cached_negative_embed = None
-        self._cached_negative_pooled = None
         self.prev_image_result = None
-        self._last_transition_id = None
-        self._pooled_source = None
-        self._pooled_target = None
-        self._transition_total_steps = 0
-        if hasattr(self, "embedding_blender"):
-            try:
-                self.embedding_blender.cancel_transition()
-            except Exception:
-                pass
         self._cancel_seed_transition()
 
         # Build TRT engines for the new model now so the next frame doesn't stall.
@@ -1171,417 +1127,19 @@ class StreamDiffusionPipeline(Pipeline):
         self._advance_seed_transition()
 
         # --- Prompt embeddings & transitions ---
-        # The key includes spatial dims for SDXL because add_time_ids depend on them.
-        # When an explicit transition dict is present, its target_prompts is the
-        # authoritative destination; keying against the incoming source prompts
-        # would make prompts_changed flap during/after the transition and snap
-        # steady state back to the source.
-        key_prompts = prompts
-        if transition is not None:
-            target_raw = transition.get("target_prompts")
-            if target_raw:
-                key_prompts = self._normalize_prompts(target_raw)
-        new_prompts_key = self._make_prompts_key(
-            key_prompts, prompt_interpolation_method, width, height
+        # All prompt encoding, blending, transition handling, and SDXL aug-
+        # conditioning lives in the PromptEncoder helper. After this call,
+        # ``self.prompts.prompt_embeds`` (and add_text_embeds / add_time_ids
+        # for SDXL) holds the conditioning for this frame.
+        self.prompts.encode_for_frame(
+            prompts=prompts,
+            interpolation_method=prompt_interpolation_method,
+            width=width,
+            height=height,
+            batch_size=self.batch_size,
+            transition=transition,
+            transition_steps=transition_steps,
         )
-        prompts_changed = new_prompts_key != self._prompts_key
-
-        # Hash the explicit transition dict so repeated sends don't restart it.
-        transition_id = self._hash_transition(transition) if transition else None
-        new_explicit_transition = (
-            transition_id is not None and transition_id != self._last_transition_id
-        )
-
-        started_transition = False
-
-        # Cancel any in-flight transition if a new target has arrived so we
-        # redirect from the current interpolated position rather than snapping
-        # after the old transition drains.
-        if self.embedding_blender.is_transitioning() and (
-            new_explicit_transition
-            or (transition is None and transition_steps > 0 and prompts_changed)
-        ):
-            self.embedding_blender.cancel_transition()
-            self._finish_pooled_transition()
-
-        # 1) Explicit transition (transition dict with target_prompts).
-        if new_explicit_transition and not self.embedding_blender.is_transitioning():
-            transition_config = parse_transition_config(transition)
-            target_prompts_raw = transition.get("target_prompts", [])
-            if transition_config.num_steps > 0 and target_prompts_raw:
-                target_prompts = self._normalize_prompts(target_prompts_raw)
-                started_transition = self._begin_transition(
-                    target_prompts=target_prompts,
-                    interpolation_method=prompt_interpolation_method,
-                    num_steps=transition_config.num_steps,
-                    temporal_method=transition_config.temporal_interpolation_method,
-                    width=width,
-                    height=height,
-                )
-            self._last_transition_id = transition_id
-
-        # 2) Auto-transition when `prompts` changes with transition_steps > 0.
-        elif (
-            transition is None
-            and transition_steps > 0
-            and prompts_changed
-            and self._previous_prompt_embeddings is not None
-            and not self.embedding_blender.is_transitioning()
-        ):
-            started_transition = self._begin_transition(
-                target_prompts=prompts,
-                interpolation_method=prompt_interpolation_method,
-                num_steps=transition_steps,
-                temporal_method=prompt_interpolation_method,
-                width=width,
-                height=height,
-            )
-
-        # --- Produce prompt_embeds for this frame ---
-        if self.embedding_blender.is_transitioning():
-            next_embedding = self.embedding_blender.get_next_embedding()
-            if next_embedding is not None:
-                self.prompt_embeds = next_embedding.repeat(self.batch_size, 1, 1)
-                self._advance_pooled_transition()
-            else:
-                self.prompt_embeds = self._cached_base_embed.repeat(
-                    self.batch_size, 1, 1
-                )
-                self._finish_pooled_transition()
-        else:
-            # Steady state — re-encode if prompts changed and we didn't start a
-            # transition for it (hard cut path, e.g. transition_steps == 0).
-            if prompts_changed and not started_transition:
-                raw_embeds, _ = self._encode_prompts_array(
-                    key_prompts, prompt_interpolation_method
-                )
-                self._cached_base_embed = raw_embeds[0:1]
-                self._prompts_key = new_prompts_key
-            # Drop the transition-id guard once the explicit dict is gone so a
-            # later identical dict is treated as a fresh request.
-            if transition is None:
-                self._last_transition_id = None
-            self._finish_pooled_transition()
-            self.prompt_embeds = self._cached_base_embed.repeat(self.batch_size, 1, 1)
-
-        # Cache embedding as source for the next transition.
-        self._previous_prompt_embeddings = self.prompt_embeds[0:1].detach()
-
-    def _make_prompts_key(
-        self,
-        prompts: list[dict],
-        interpolation_method: str,
-        width: int,
-        height: int,
-    ) -> tuple:
-        """Identity key for a prompts payload; SDXL includes dims for add_time_ids."""
-        return (
-            tuple((p.get("text", ""), p.get("weight", 1.0)) for p in prompts),
-            interpolation_method,
-            (width, height) if self.sdxl else (),
-        )
-
-    @staticmethod
-    def _hash_transition(transition: dict) -> str:
-        """Stable identity for a transition dict so repeated sends don't restart it."""
-        import hashlib
-        import json
-
-        payload = {
-            "num_steps": int(transition.get("num_steps", 0) or 0),
-            "method": transition.get("temporal_interpolation_method", "linear"),
-            "target": [
-                {
-                    "text": p.get("text", "") if isinstance(p, dict) else str(p),
-                    "weight": float(p.get("weight", 1.0)) if isinstance(p, dict) else 1.0,
-                }
-                for p in (transition.get("target_prompts") or [])
-            ],
-        }
-        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
-        return hashlib.sha1(encoded).hexdigest()
-
-    def _begin_transition(
-        self,
-        target_prompts: list[dict],
-        interpolation_method: str,
-        num_steps: int,
-        temporal_method: str,
-        width: int,
-        height: int,
-    ) -> bool:
-        """Start a temporal transition from the last emitted embedding toward
-        the target prompts.  Eagerly advances `_cached_base_embed` and
-        `_prompts_key` to the target so steady state lands there when the queue
-        drains.  Returns True if a transition was actually started.
-        """
-        source_embedding = self._previous_prompt_embeddings
-        if source_embedding is None:
-            return False
-
-        # Encode and blend target in main embedding space + pooled (SDXL).
-        target_embed, target_pooled = self._encode_prompts_array(
-            target_prompts, interpolation_method, apply_sdxl_conditioning=False
-        )
-        target_embed_single = target_embed[0:1]
-
-        # Eagerly move the steady-state cache to the target so once the queue
-        # drains we land on the target prompts with no bounce-back.
-        self._cached_base_embed = target_embed_single
-        self._prompts_key = self._make_prompts_key(
-            target_prompts, interpolation_method, width, height
-        )
-
-        # Slerp is not supported here: upstream EmbeddingBlender.slerp runs
-        # torch.acos on the native dtype; at fp16 the [-1, 1] clamp isn't
-        # enough to prevent acos(1.0) → NaN at certain token positions, which
-        # nukes the whole conditioning tensor. Until that's fixed upstream,
-        # fall back to linear and warn once.
-        if temporal_method == "slerp":
-            if not getattr(self, "_slerp_fallback_warned", False):
-                print(
-                    "[StreamDiffusion] slerp temporal interpolation is not "
-                    "supported (fp16 NaN in upstream blender); falling back "
-                    "to linear."
-                )
-                self._slerp_fallback_warned = True
-            temporal_method = "linear"
-
-        self.embedding_blender.start_transition(
-            source_embedding=source_embedding,
-            target_embedding=target_embed_single,
-            num_steps=num_steps,
-            temporal_interpolation_method=temporal_method,
-        )
-
-        # Pooled interpolation runs in lockstep with the main queue for SDXL.
-        if self.sdxl and target_pooled is not None:
-            self._pooled_source = (
-                self.add_text_embeds.detach().clone()
-                if hasattr(self, "add_text_embeds") and self.add_text_embeds is not None
-                else target_pooled.clone()
-            )
-            self._pooled_target = target_pooled.clone()
-            self._transition_total_steps = max(1, num_steps)
-        else:
-            self._pooled_source = None
-            self._pooled_target = None
-            self._transition_total_steps = 0
-
-        # start_transition short-circuits when source ≈ target
-        # (MIN_EMBEDDING_DIFF_THRESHOLD); report accurately so the caller falls
-        # to steady state instead of assuming a transition is live.
-        if not self.embedding_blender.is_transitioning():
-            self._finish_pooled_transition()
-            return False
-        return True
-
-    def _advance_pooled_transition(self) -> None:
-        """Linearly interpolate `add_text_embeds` toward the target pooled.
-
-        Uses the blender's remaining queue length to compute progress so
-        pooled and main embeds stay in lockstep even if start_transition
-        short-circuited.
-        """
-        if not self.sdxl or self._pooled_target is None:
-            return
-        if self._transition_total_steps <= 0:
-            return
-        remaining = len(self.embedding_blender._transition_queue)
-        done_steps = self._transition_total_steps - remaining
-        t = min(1.0, max(0.0, done_steps / self._transition_total_steps))
-        source = (
-            self._pooled_source
-            if self._pooled_source is not None
-            else self._pooled_target
-        )
-        self.add_text_embeds = torch.lerp(source, self._pooled_target, t).to(
-            dtype=self.dtype, device=self.device
-        )
-
-    def _finish_pooled_transition(self) -> None:
-        """Snap pooled to the target and clear transition state."""
-        if self.sdxl and self._pooled_target is not None:
-            self.add_text_embeds = self._pooled_target.to(
-                dtype=self.dtype, device=self.device
-            )
-        self._pooled_source = None
-        self._pooled_target = None
-        self._transition_total_steps = 0
-
-    @staticmethod
-    def _normalize_prompts(prompts: str | list[str] | list[dict]) -> list[dict]:
-        """Normalize prompts to list[dict] format."""
-        if isinstance(prompts, str):
-            return [{"text": prompts, "weight": 1.0}]
-        if isinstance(prompts, list):
-            if len(prompts) == 0:
-                return [{"text": "", "weight": 1.0}]
-            # Check if it's a list of strings
-            if isinstance(prompts[0], str):
-                return [{"text": text, "weight": 1.0} for text in prompts]
-            # Already list[dict]
-            return prompts
-        return [{"text": str(prompts), "weight": 1.0}]
-
-    def _encode_single_prompt(
-        self, prompt_text: str
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Encode a single prompt string to embeddings.
-
-        Returns:
-            (prompt_embeds, pooled_embeds) tuple
-        """
-        # Use diffusers' built-in encoding
-        encoder_output = self.pipe.encode_prompt(
-            prompt=prompt_text,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=False,
-            negative_prompt=None,
-        )
-        prompt_embeds = encoder_output[0]  # [1, seq_len, hidden_dim]
-        pooled_embeds = encoder_output[2] if self.sdxl else None
-
-        return prompt_embeds, pooled_embeds
-
-    def _apply_negative_subtraction(
-        self,
-        negative_prompt: str,
-        negative_prompt_scale: float,
-    ) -> None:
-        """Norm-preserving negative subtraction in embedding space.
-
-        Single-pass models (Turbo, DMD2) can't use standard CFG without
-        doubling UNet cost. Embedding subtraction is the cheap alternative,
-        but raw ``pos - scale * neg`` blows up the L2 norm of each token,
-        knocking the conditioning out of the training distribution and the
-        UNet predicts pure noise.
-
-        We do the subtraction directionally and then renormalize each
-        token's embedding back to the original L2 norm. Result: direction
-        shifts away from the negative concept, magnitude is preserved.
-        Same treatment applied to SDXL's pooled ``add_text_embeds``.
-
-        ``add_time_ids`` are positional / size-derived, not text-derived,
-        so they stay put.
-
-        Encoded negative is cached on text; empty text or scale 0 is a
-        no-op. Cache invalidates on model swap (text-encoder dim changes).
-        """
-        if negative_prompt_scale <= 0 or not negative_prompt:
-            return
-        if (
-            self._cached_negative_text != negative_prompt
-            or self._cached_negative_embed is None
-        ):
-            neg_embed, neg_pooled = self._encode_single_prompt(negative_prompt)
-            self._cached_negative_text = negative_prompt
-            self._cached_negative_embed = neg_embed.detach()
-            self._cached_negative_pooled = (
-                neg_pooled.detach() if neg_pooled is not None else None
-            )
-
-        self.prompt_embeds = self._norm_preserving_subtract(
-            self.prompt_embeds, self._cached_negative_embed, negative_prompt_scale
-        )
-        if self.sdxl and self._cached_negative_pooled is not None:
-            self.add_text_embeds = self._norm_preserving_subtract(
-                self.add_text_embeds,
-                self._cached_negative_pooled,
-                negative_prompt_scale,
-            )
-
-    @staticmethod
-    def _norm_preserving_subtract(
-        positive: torch.Tensor, negative: torch.Tensor, scale: float
-    ) -> torch.Tensor:
-        """Subtract ``scale * negative`` from ``positive`` then rescale to
-        match positive's original per-row L2 norm. Direction shifts,
-        magnitude is preserved, UNet stays inside training distribution.
-        """
-        neg = negative.to(device=positive.device, dtype=positive.dtype)
-        if neg.shape[0] != positive.shape[0]:
-            neg = neg[:1].expand_as(positive)
-        # Per-token (or per-row for pooled) norm preservation: keep an
-        # epsilon to avoid /0 for any zero-magnitude rows.
-        orig_norm = positive.norm(dim=-1, keepdim=True)
-        shifted = positive - scale * neg
-        new_norm = shifted.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        return shifted * (orig_norm / new_norm)
-
-    def _encode_prompts_array(
-        self,
-        prompt_items: list[dict],
-        interpolation_method: str = "linear",
-        apply_sdxl_conditioning: bool = True,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Encode multiple weighted prompts and blend them.
-
-        Args:
-            prompt_items: List of {"text": str, "weight": float}
-            interpolation_method: "linear" or "slerp"
-            apply_sdxl_conditioning: When True (default, steady-state encode),
-                also updates `self.add_text_embeds` and `self.add_time_ids`
-                for SDXL. Set False when encoding a transition target so the
-                in-flight pooled/time_ids aren't overwritten mid-morph.
-
-        Returns:
-            (blended_prompt_embeds, blended_pooled_embeds) tuple
-        """
-        if not prompt_items:
-            prompt_items = [{"text": "", "weight": 1.0}]
-
-        # Extract texts and weights
-        texts = [item.get("text", "") for item in prompt_items]
-        weights = [item.get("weight", 1.0) for item in prompt_items]
-
-        # Encode each prompt
-        all_prompt_embeds = []
-        all_pooled_embeds = [] if self.sdxl else None
-
-        for text in texts:
-            prompt_embeds, pooled_embeds = self._encode_single_prompt(text)
-            all_prompt_embeds.append(prompt_embeds)
-            if self.sdxl and pooled_embeds is not None:
-                all_pooled_embeds.append(pooled_embeds)
-
-        # Blend embeddings
-        blended_prompt_embeds = self.embedding_blender.blend(
-            all_prompt_embeds,
-            weights,
-            interpolation_method,
-            cache_result=True,
-        )
-
-        blended_pooled_embeds = None
-        if self.sdxl and all_pooled_embeds:
-            blended_pooled_embeds = self.embedding_blender.blend(
-                all_pooled_embeds,
-                weights,
-                interpolation_method,
-                cache_result=False,
-            )
-
-        # Handle SDXL additional embeddings (skipped for transition-target
-        # encoding so the live pooled/time_ids aren't overwritten mid-morph).
-        if apply_sdxl_conditioning and self.sdxl and blended_pooled_embeds is not None:
-            self.add_text_embeds = blended_pooled_embeds
-            original_size = (self.height, self.width)
-            crops_coords_top_left = (0, 0)
-            target_size = (self.height, self.width)
-            text_encoder_projection_dim = int(self.add_text_embeds.shape[-1])
-            self.add_time_ids = self._get_add_time_ids(
-                original_size,
-                crops_coords_top_left,
-                target_size,
-                dtype=self.dtype,
-                text_encoder_projection_dim=text_encoder_projection_dim,
-            )
-
-        return blended_prompt_embeds.repeat(
-            self.batch_size, 1, 1
-        ), blended_pooled_embeds
 
     def _set_timesteps(self, num_inference_steps: int, strength: float):
         """Set the timesteps for the diffusion process.
@@ -1768,31 +1326,6 @@ class StreamDiffusionPipeline(Pipeline):
         self._seed_transition_progress = 0
         self._seed_transition_total = 0
 
-    def _get_add_time_ids(
-        self,
-        original_size,
-        crops_coords_top_left,
-        target_size,
-        dtype,
-        text_encoder_projection_dim=None,
-    ):
-        """Get additional time IDs for SDXL."""
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-
-        passed_add_embed_dim = (
-            self.unet.config.addition_time_embed_dim * len(add_time_ids)
-            + text_encoder_projection_dim
-        )
-        expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
-
-        if expected_add_embed_dim != passed_add_embed_dim:
-            raise ValueError(
-                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, "
-                f"but a vector of {passed_add_embed_dim} was created."
-            )
-
-        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
-        return add_time_ids
 
     def _encode_image(
         self, image_tensors: torch.Tensor, add_noise: bool = True
@@ -1883,7 +1416,7 @@ class StreamDiffusionPipeline(Pipeline):
             down_block_res_samples, mid_block_res_sample = self.controlnet(
                 x_t_latent_plus_uc,
                 t_list,
-                encoder_hidden_states=self.prompt_embeds,
+                encoder_hidden_states=self.prompts.prompt_embeds,
                 controlnet_cond=cond_image,
                 conditioning_scale=self.controlnet_conditioning_scale,
                 return_dict=False,
@@ -1892,7 +1425,7 @@ class StreamDiffusionPipeline(Pipeline):
         model_pred = self.unet(
             x_t_latent_plus_uc,
             t_list,
-            encoder_hidden_states=self.prompt_embeds,
+            encoder_hidden_states=self.prompts.prompt_embeds,
             added_cond_kwargs=added_cond_kwargs,
             down_block_additional_residuals=down_block_res_samples,
             mid_block_additional_residual=mid_block_res_sample,
@@ -1945,8 +1478,8 @@ class StreamDiffusionPipeline(Pipeline):
             t_list = self.sub_timesteps_tensor
             if self.sdxl:
                 batch = x_t_latent.shape[0]
-                te = self.add_text_embeds.to(self.device)
-                ti = self.add_time_ids.to(self.device)
+                te = self.prompts.add_text_embeds.to(self.device)
+                ti = self.prompts.add_time_ids.to(self.device)
                 if te.shape[0] != batch:
                     te = te[:1].expand(batch, -1)
                 if ti.shape[0] != batch:
@@ -1971,8 +1504,8 @@ class StreamDiffusionPipeline(Pipeline):
                 )
                 if self.sdxl:
                     added_cond_kwargs = {
-                        "text_embeds": self.add_text_embeds.to(self.device),
-                        "time_ids": self.add_time_ids.to(self.device),
+                        "text_embeds": self.prompts.add_text_embeds.to(self.device),
+                        "time_ids": self.prompts.add_time_ids.to(self.device),
                     }
                 x_0_pred, _model_pred = self._unet_step(
                     x_t_latent, t, idx=idx, added_cond_kwargs=added_cond_kwargs
@@ -2043,7 +1576,7 @@ class StreamDiffusionPipeline(Pipeline):
         prompts = kwargs.get("prompts", [])
         # Normalize to list[dict] format
         prompts = (
-            self._normalize_prompts(prompts)
+            normalize_prompts(prompts)
             if prompts
             else [{"text": "", "weight": 1.0}]
         )
@@ -2207,7 +1740,7 @@ class StreamDiffusionPipeline(Pipeline):
         # are settled (including any prompt transition / SDXL pooled
         # update). Acts on whatever this frame's conditioning happens to
         # be, which is the right thing during transitions too.
-        self._apply_negative_subtraction(negative_prompt, negative_prompt_scale)
+        self.prompts.apply_negative_subtraction(negative_prompt, negative_prompt_scale)
 
         frame = None
 
