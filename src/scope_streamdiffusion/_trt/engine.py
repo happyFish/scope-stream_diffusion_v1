@@ -287,7 +287,24 @@ class AutoencoderKLEngine:
         self.encoder.activate()
         self.decoder.activate()
 
+    def _ensure_activated(self, engine):
+        """Re-activate the TRT engine if its execution context was lost.
+
+        The cached adapter survives across plugin reinit (module-scope
+        cache in ``_trt_cache``), but rapid acceleration_mode / model
+        swaps can leave a previously-activated engine with context=None
+        if its activation was torn down by a sibling teardown path.
+        Repairing here keeps the streaming loop alive instead of dying
+        on `AttributeError: 'NoneType' object has no attribute
+        'set_input_shape'`.
+        """
+        if engine.context is None:
+            if engine.engine is None:
+                engine.load()
+            engine.activate()
+
     def encode(self, images: torch.Tensor, **kwargs):
+        self._ensure_activated(self.encoder)
         self.encoder.allocate_buffers(
             shape_dict={
                 "images": images.shape,
@@ -308,6 +325,7 @@ class AutoencoderKLEngine:
         return AutoencoderTinyOutput(latents=latents)
 
     def decode(self, latent: torch.Tensor, **kwargs):
+        self._ensure_activated(self.decoder)
         self.decoder.allocate_buffers(
             shape_dict={
                 "latent": latent.shape,
