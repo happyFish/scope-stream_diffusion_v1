@@ -195,11 +195,19 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     negative_prompt_scale: float = Field(
-        default=1.0,
+        default=0.5,
         ge=0.0,
         le=2.0,
-        description="Strength of embedding-space negative guidance (used when guidance_scale=0). Subtracts the negative prompt embedding from the positive. 0 = disabled, 1 = full subtraction.",
-        #json_schema_extra=ui_field_config(order=12, label="Negative Scale"),
+        description=(
+            "Strength of embedding-space negative guidance for single-pass "
+            "models (Turbo, DMD2) that can't use standard CFG. The negative "
+            "embedding is subtracted from the positive then rescaled to "
+            "preserve magnitude — direction shifts but the result stays in "
+            "the UNet's training distribution. 0 = disabled. 0.3-0.7 is "
+            "typical; >1.0 starts to push out of distribution and outputs "
+            "may degrade or go to noise."
+        ),
+        json_schema_extra=ui_field_config(order=12, label="Negative Scale"),
     )
 
     prompt_interpolation_method: Literal["linear", "slerp"] = Field(

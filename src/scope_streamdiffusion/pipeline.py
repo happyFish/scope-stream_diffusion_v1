@@ -262,6 +262,16 @@ class StreamDiffusionPipeline(Pipeline):
         self._seed_transition_progress: int = 0
         self._seed_transition_total: int = 0
 
+        # Negative-prompt embedding cache. We don't run a second UNet pass
+        # for CFG (DMD2 / SD-Turbo are CFG-distilled), so "negative prompt"
+        # here means embedding-space subtraction: prompt_embeds -= scale *
+        # neg_embed before the single UNet call. Cache the encoded negative
+        # so we don't re-encode every frame; invalidate when the text or
+        # the model changes.
+        self._cached_negative_text: str | None = None
+        self._cached_negative_embed: torch.Tensor | None = None
+        self._cached_negative_pooled: torch.Tensor | None = None
+
         # Mode-transition tracking — detect video↔text switches without a pipeline reload
         self._last_mode: str | None = None
 
@@ -908,6 +918,10 @@ class StreamDiffusionPipeline(Pipeline):
         self._pooled_target = None
         self._seed_transition_source = None
         self._seed_transition_target = None
+        # Negative-embed cache is text-encoder-specific; swap invalidates it.
+        self._cached_negative_text = None
+        self._cached_negative_embed = None
+        self._cached_negative_pooled = None
         if hasattr(self, "embedding_blender"):
             try:
                 self.embedding_blender.cancel_transition()
@@ -971,6 +985,9 @@ class StreamDiffusionPipeline(Pipeline):
         self._prompts_key = None
         self._cached_base_embed = None
         self._previous_prompt_embeddings = None
+        self._cached_negative_text = None
+        self._cached_negative_embed = None
+        self._cached_negative_pooled = None
         self.prev_image_result = None
         self._last_transition_id = None
         self._pooled_source = None
@@ -1427,6 +1444,71 @@ class StreamDiffusionPipeline(Pipeline):
         pooled_embeds = encoder_output[2] if self.sdxl else None
 
         return prompt_embeds, pooled_embeds
+
+    def _apply_negative_subtraction(
+        self,
+        negative_prompt: str,
+        negative_prompt_scale: float,
+    ) -> None:
+        """Norm-preserving negative subtraction in embedding space.
+
+        Single-pass models (Turbo, DMD2) can't use standard CFG without
+        doubling UNet cost. Embedding subtraction is the cheap alternative,
+        but raw ``pos - scale * neg`` blows up the L2 norm of each token,
+        knocking the conditioning out of the training distribution and the
+        UNet predicts pure noise.
+
+        We do the subtraction directionally and then renormalize each
+        token's embedding back to the original L2 norm. Result: direction
+        shifts away from the negative concept, magnitude is preserved.
+        Same treatment applied to SDXL's pooled ``add_text_embeds``.
+
+        ``add_time_ids`` are positional / size-derived, not text-derived,
+        so they stay put.
+
+        Encoded negative is cached on text; empty text or scale 0 is a
+        no-op. Cache invalidates on model swap (text-encoder dim changes).
+        """
+        if negative_prompt_scale <= 0 or not negative_prompt:
+            return
+        if (
+            self._cached_negative_text != negative_prompt
+            or self._cached_negative_embed is None
+        ):
+            neg_embed, neg_pooled = self._encode_single_prompt(negative_prompt)
+            self._cached_negative_text = negative_prompt
+            self._cached_negative_embed = neg_embed.detach()
+            self._cached_negative_pooled = (
+                neg_pooled.detach() if neg_pooled is not None else None
+            )
+
+        self.prompt_embeds = self._norm_preserving_subtract(
+            self.prompt_embeds, self._cached_negative_embed, negative_prompt_scale
+        )
+        if self.sdxl and self._cached_negative_pooled is not None:
+            self.add_text_embeds = self._norm_preserving_subtract(
+                self.add_text_embeds,
+                self._cached_negative_pooled,
+                negative_prompt_scale,
+            )
+
+    @staticmethod
+    def _norm_preserving_subtract(
+        positive: torch.Tensor, negative: torch.Tensor, scale: float
+    ) -> torch.Tensor:
+        """Subtract ``scale * negative`` from ``positive`` then rescale to
+        match positive's original per-row L2 norm. Direction shifts,
+        magnitude is preserved, UNet stays inside training distribution.
+        """
+        neg = negative.to(device=positive.device, dtype=positive.dtype)
+        if neg.shape[0] != positive.shape[0]:
+            neg = neg[:1].expand_as(positive)
+        # Per-token (or per-row for pooled) norm preservation: keep an
+        # epsilon to avoid /0 for any zero-magnitude rows.
+        orig_norm = positive.norm(dim=-1, keepdim=True)
+        shifted = positive - scale * neg
+        new_norm = shifted.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return shifted * (orig_norm / new_norm)
 
     def _encode_prompts_array(
         self,
@@ -2020,6 +2102,8 @@ class StreamDiffusionPipeline(Pipeline):
         do_add_noise = get_param("do_add_noise", True)
         similar_image_filter_enabled = get_param("similar_image_filter_enabled", False)
         image_loopback = get_param("image_loopback", False)
+        negative_prompt = get_param("negative_prompt", "")
+        negative_prompt_scale = float(get_param("negative_prompt_scale", 1.0))
         controlnet_mode = get_param("controlnet_mode", "none")
         controlnet_scale = get_param("controlnet_scale", 1.0)
         controlnet_temporal_smoothing = get_param("controlnet_temporal_smoothing", 0.5)
@@ -2118,6 +2202,12 @@ class StreamDiffusionPipeline(Pipeline):
             transition_steps=transition_steps,
             seed_transition_steps=seed_transition_steps,
         )
+
+        # Apply embedding-space negative subtraction *after* prompt embeds
+        # are settled (including any prompt transition / SDXL pooled
+        # update). Acts on whatever this frame's conditioning happens to
+        # be, which is the right thing during transitions too.
+        self._apply_negative_subtraction(negative_prompt, negative_prompt_scale)
 
         frame = None
 
