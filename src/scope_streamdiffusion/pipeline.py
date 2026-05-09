@@ -50,6 +50,12 @@ MODEL_PRESETS: Dict[str, dict] = {
         # DMD2 was distilled at this specific timestep — feeding it
         # LCMScheduler's default 1-step pick (~979) produces noise.
         "timesteps_override": [399],
+        # DMD2 has CFG distilled into its weights, so its single-shot
+        # output already looks like a guidance-shaped result. Implicit
+        # txt2img→img2img loopback re-applies that CFG-shape every frame
+        # and the chain blows up within a few iterations. Skip the
+        # implicit fallback; explicit image_loopback=True still works.
+        "implicit_loopback": False,
     },
 }
 
@@ -123,7 +129,14 @@ class StreamDiffusionPipeline(Pipeline):
         config_model = getattr(self.config, "model_id_or_path", None) if self.config else None
         model_id = model_id or config_model or model_id_or_path or "stabilityai/sd-turbo"
         self.model_id = model_id
-        self._timesteps_override = MODEL_PRESETS.get(model_id, {}).get("timesteps_override")
+        preset = MODEL_PRESETS.get(model_id, {})
+        self._timesteps_override = preset.get("timesteps_override")
+        # CFG-distilled models (DMD2, future Hyper-SD / Lightning) explode in
+        # the implicit txt2img→img2img loopback because each iteration re-
+        # applies the model's baked-in guidance shaping. Default True for
+        # everything else (SD-Turbo, SDXL-Turbo) since the iterative
+        # refinement is what gives those models their polished t2i look.
+        self._implicit_loopback: bool = preset.get("implicit_loopback", True)
         print(f"[StreamDiffusion] Tentative model: {model_id} (load deferred to first __call__)")
 
         # Model-dependent attrs are populated by ``_ensure_pipe_loaded``.
@@ -274,7 +287,9 @@ class StreamDiffusionPipeline(Pipeline):
             return
         print(f"[StreamDiffusion] Loading model: {model_id}")
         self.model_id = model_id
-        self._timesteps_override = MODEL_PRESETS.get(model_id, {}).get("timesteps_override")
+        preset = MODEL_PRESETS.get(model_id, {})
+        self._timesteps_override = preset.get("timesteps_override")
+        self._implicit_loopback = preset.get("implicit_loopback", True)
         self._trt_cache_key = _trt_cache.cache_key(self._node_id, model_id)
         self.pipe = self._load_model(model_id)
         print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
@@ -931,7 +946,9 @@ class StreamDiffusionPipeline(Pipeline):
         self._release_pipe_state()
 
         self.model_id = new_model_id
-        self._timesteps_override = MODEL_PRESETS.get(new_model_id, {}).get("timesteps_override")
+        preset = MODEL_PRESETS.get(new_model_id, {})
+        self._timesteps_override = preset.get("timesteps_override")
+        self._implicit_loopback = preset.get("implicit_loopback", True)
         self.pipe = self._load_model(new_model_id)
         print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
         self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
@@ -2109,12 +2126,15 @@ class StreamDiffusionPipeline(Pipeline):
         # This is what gives txt2img its iterative refinement: frame 1 is a
         # cold t2i pass and frames 2+ are img2img on the previous output, so
         # SD-Turbo's single-step recovery sharpens detail across frames.
-        # Removing the fallback (strict opt-in via image_loopback) loses the
-        # refinement and txt2img output stays at single-shot quality forever.
-        # The drift this can cause on long runs is the cost of admission.
-        if image_loopback or (
-            (video is None or len(video) == 0) and self.prev_image_result is not None
-        ):
+        # Disabled per-model for CFG-distilled checkpoints (DMD2) where the
+        # baked-in guidance shaping compounds catastrophically across the
+        # feedback loop. Explicit image_loopback=True still wins regardless,
+        # so the user can force loopback on DMD2 if they want the stylized
+        # divergence (or for testing).
+        implicit_ok = self._implicit_loopback and (
+            video is None or len(video) == 0
+        ) and self.prev_image_result is not None
+        if image_loopback or implicit_ok:
             frame = self.prev_image_result
         elif video is not None and len(video) > 0:
             # Convert Scope tensor format to pipeline format
