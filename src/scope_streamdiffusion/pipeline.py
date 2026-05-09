@@ -25,27 +25,6 @@ if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
 
 
-# Import or inline the helper utilities
-class SimilarImageFilter:
-    """Simple similar image filter implementation."""
-
-    def __init__(self):
-        self.threshold = 0.98
-        self.max_skip_frame = 10
-        self.skip_count = 0
-
-    def set_threshold(self, threshold: float):
-        self.threshold = threshold
-
-    def set_max_skip_frame(self, max_skip_frame: int):
-        self.max_skip_frame = max_skip_frame
-
-    def __call__(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        # Simplified - always return the image
-        # TODO: Implement actual similarity checking
-        return image_tensor
-
-
 class StreamDiffusionPipeline(Pipeline):
     """StreamDiffusion pipeline for real-time Stable Diffusion generation."""
 
@@ -167,7 +146,6 @@ class StreamDiffusionPipeline(Pipeline):
 
         # State that will be set during runtime
         self.generator = torch.Generator(device=self.device)
-        self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.inference_time_ema = 0
 
@@ -192,7 +170,6 @@ class StreamDiffusionPipeline(Pipeline):
         self.guidance_scale = 0.0
         self.delta = 1.0
         self.t_list = [0]
-        self.similar_image_filter = False
 
         # Cache keys for _prepare_runtime_state — None forces full recompute on first call
         self._schedule_key: tuple | None = (
@@ -874,7 +851,6 @@ class StreamDiffusionPipeline(Pipeline):
         height = get_param("height", 512)
         use_denoising_batch = get_param("use_denoising_batch", True)
         do_add_noise = get_param("do_add_noise", True)
-        similar_image_filter_enabled = get_param("similar_image_filter_enabled", False)
         image_loopback = get_param("image_loopback", False)
         negative_prompt = get_param("negative_prompt", "")
         negative_prompt_scale = float(get_param("negative_prompt_scale", 1.0))
@@ -1034,15 +1010,6 @@ class StreamDiffusionPipeline(Pipeline):
             # Convert HWC -> CHW and add batch dimension: (H, W, C) -> (1, C, H, W)
             input_tensor = frame.permute(2, 0, 1).unsqueeze(0)
 
-            # Apply similar image filter if enabled
-            if similar_image_filter_enabled:
-                filtered = self.similar_filter(input_tensor)
-                if filtered is None and self.prev_image_result is not None:
-                    # Return previous result
-                    output = self.prev_image_result
-                    return {"video": output.permute(0, 2, 3, 1).clamp(0, 1)}
-                input_tensor = filtered
-
             input_latent = self._encode_image(input_tensor, add_noise=True)
 
         else:
@@ -1117,7 +1084,6 @@ def main():
         "height": 512,
         "use_denoising_batch": True,
         "do_add_noise": True,
-        "similar_image_filter_enabled": False,
     }
 
     print("\nTest parameters:")

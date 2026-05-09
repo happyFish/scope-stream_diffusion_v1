@@ -299,24 +299,6 @@ class StreamDiffusionConfig(BasePipelineConfig):
     )
 
     # ========================================
-    # Image Filtering
-    # ========================================
-
-    similar_image_filter_enabled: bool = Field(
-        default=False,
-        description="Enable similar image filter to skip redundant frames",
-        # json_schema_extra=ui_field_config(order=40, label="Similar Image Filter"),
-    )
-
-    similar_image_filter_threshold: float = Field(
-        default=0.9,
-        ge=0.0,
-        le=1.0,
-        description="Similarity threshold (higher = more strict filtering)",
-        # json_schema_extra=ui_field_config(order=41, label="Filter Threshold"),
-    )
-
-    # ========================================
     # Additional Options
     # ========================================
 
