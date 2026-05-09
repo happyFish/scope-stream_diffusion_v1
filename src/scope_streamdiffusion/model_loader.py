@@ -350,30 +350,22 @@ class ModelLoader:
         if hasattr(p, "_cn") and p._cn is not None:
             p._cn.release()
 
-        # Cached per-step tensors.
-        for attr in (
-            "init_noise",
-            "stock_noise",
-            "x_t_latent_buffer",
-            "prev_image_result",
-            "alpha_prod_t_sqrt",
-            "beta_prod_t_sqrt",
-            "c_skip",
-            "c_out",
-            "sub_timesteps_tensor",
-            "timesteps",
-        ):
-            if hasattr(p, attr):
-                setattr(p, attr, None)
+        # Cached per-frame state.
+        p.prev_image_result = None
+        if hasattr(p, "inference") and p.inference is not None:
+            p.inference.reset_buffers()
+            p.inference.timesteps = None
+            p.inference.sub_timesteps = []
+            p.inference.sub_timesteps_tensor = None
+            p.inference.c_skip = None
+            p.inference.c_out = None
+            p.inference.alpha_prod_t_sqrt = None
+            p.inference.beta_prod_t_sqrt = None
 
         # Reset prompt-encoder caches (text-encoder-specific; the new
         # model will have a different text encoder).
         if hasattr(p, "prompts"):
             p.prompts.reset_caches()
-
-        # Seed-transition state.
-        p._seed_transition_source = None
-        p._seed_transition_target = None
 
         # Drop the pipeline last so any of the above that aliased its
         # submodules have already been nulled.
@@ -394,7 +386,7 @@ class ModelLoader:
         rebuild the model parts here so picking a model in the UI actually
         swaps it. Stalls the frame loop while loading — same as a fresh load.
 
-        Helper attach order: PromptEncoder, ControlNetHandler, TRTLifecycle.
+        Helper attach order: PromptEncoder, InferenceCore, TRTLifecycle.
         TRT runs last because its engine builds need ``pipe.unet`` and the
         freshly-loaded text-encoder / VAE state to be in place.
         """
@@ -429,6 +421,7 @@ class ModelLoader:
         p.scheduler = LCMScheduler.from_config(p.pipe.scheduler.config)
         p.image_processor = VaeImageProcessor(p.pipe.vae_scale_factor)
         p.prompts.attach(p.pipe, p.sdxl)
+        p.inference.attach(p)
         p.trt.attach(p, p.sdxl)
 
         # Invalidate runtime caches so the next __call__ rebuilds the
@@ -437,7 +430,7 @@ class ModelLoader:
         p._schedule_key = None
         p._noise_shape = None
         p.prev_image_result = None
-        p._cancel_seed_transition()
+        p.inference.cancel_seed_transition()
 
         # Build TRT engines for the new model now so the next frame doesn't stall.
         if p.trt.acceleration_mode == "trt":

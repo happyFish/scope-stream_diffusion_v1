@@ -1,6 +1,6 @@
 """StreamDiffusion pipeline implementation for Scope."""
 
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, List, Literal, Optional
 
 import torch
 import numpy as np
@@ -10,12 +10,10 @@ from diffusers import (
     StableDiffusionXLPipeline,
 )
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
-    retrieve_latents,
-)
 from scope.core.pipelines.interface import Pipeline, Requirements
 
 from .controlnet import ControlNetHandler
+from .inference_core import InferenceCore
 from .model_loader import MODEL_PRESETS, ModelLoader
 from .prompt_encoder import PromptEncoder, normalize_prompts
 from .schema import StreamDiffusionConfig
@@ -144,6 +142,13 @@ class StreamDiffusionPipeline(Pipeline):
         self.model_loader = ModelLoader(self.device, self.dtype)
         self.model_loader.attach(self)
 
+        # Per-frame inference: timestep schedule, noise buffers, seed
+        # transitions, VAE encode/decode, UNet/scheduler step math. Holds
+        # tensor state directly; reads scheduler/vae/unet/controlnet/prompts
+        # via the back-ref set in ``attach()``.
+        self.inference = InferenceCore(self.device, self.dtype)
+        self.inference.attach(self)
+
         # State that will be set during runtime
         self.generator = torch.Generator(device=self.device)
         self.prev_image_result = None
@@ -178,16 +183,6 @@ class StreamDiffusionPipeline(Pipeline):
         self._last_seed: int | None = None
         self._noise_shape: tuple | None = None  # (batch_size, latent_h, latent_w)
 
-        # Seed transition state — when seed_transition_steps > 0, lerp
-        # `init_noise` from the previous seed's tensor to the new seed's
-        # tensor over N frames instead of hard-swapping. SDXL-Turbo /
-        # DMD2-1step have weaker stock_noise feedback than SD-Turbo, so
-        # without this seed changes read as hard cuts.
-        self._seed_transition_source: torch.Tensor | None = None
-        self._seed_transition_target: torch.Tensor | None = None
-        self._seed_transition_progress: int = 0
-        self._seed_transition_total: int = 0
-
         # Mode-transition tracking — detect video↔text switches without a pipeline reload
         self._last_mode: str | None = None
 
@@ -209,7 +204,7 @@ class StreamDiffusionPipeline(Pipeline):
         pipeline_manager only forwards schema defaults at __init__ time.
         Subsequent runtime model changes go through ``_swap_model``.
 
-        Helper attach order: PromptEncoder, ControlNetHandler, TRTLifecycle.
+        Helper attach order: PromptEncoder, InferenceCore, TRTLifecycle.
         TRT runs last because its engine builds need ``self.pipe.unet`` and
         the freshly-loaded text-encoder / VAE state to be in place.
         """
@@ -235,6 +230,7 @@ class StreamDiffusionPipeline(Pipeline):
         self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.image_processor = VaeImageProcessor(self.pipe.vae_scale_factor)
         self.prompts.attach(self.pipe, self.sdxl)
+        self.inference.attach(self)
         self.trt.attach(self, self.sdxl)
 
         if self.trt.acceleration_mode == "trt":
@@ -320,7 +316,7 @@ class StreamDiffusionPipeline(Pipeline):
         # --- Timestep schedule: only recompute when schedule params change ---
         schedule_key = (num_inference_steps, strength, tuple(t_index_list))
         if schedule_key != self._schedule_key:
-            self._set_timesteps(num_inference_steps, strength)
+            self.inference.set_timesteps(num_inference_steps, strength)
             self._schedule_key = schedule_key
 
         # --- Seed + noise buffers: only reset when seed or spatial shape changes ---
@@ -333,16 +329,16 @@ class StreamDiffusionPipeline(Pipeline):
             # hard-reset and cancel any in-flight seed transition.
             self.generator.manual_seed(seed)
             self._last_seed = seed
-            self._cancel_seed_transition()
-            self.x_t_latent_buffer = None
-            self._initialize_noise()
+            self.inference.cancel_seed_transition()
+            self.inference.x_t_latent_buffer = None
+            self.inference.initialize_noise()
             self._noise_shape = noise_shape
         elif seed_changed:
             # Hard cut when seed_transition_steps == 0; multi-frame lerp otherwise.
-            self._setup_seed_transition(seed, seed_transition_steps)
+            self.inference.setup_seed_transition(seed, seed_transition_steps)
 
         # Advance any in-flight seed transition by one frame. No-op when idle.
-        self._advance_seed_transition()
+        self.inference.advance_seed_transition()
 
         # --- Prompt embeddings & transitions ---
         # All prompt encoding, blending, transition handling, and SDXL aug-
@@ -359,389 +355,6 @@ class StreamDiffusionPipeline(Pipeline):
             transition_steps=transition_steps,
         )
 
-    def _set_timesteps(self, num_inference_steps: int, strength: float):
-        """Set the timesteps for the diffusion process.
-
-        Honors `MODEL_PRESETS[...]["timesteps_override"]` when present.
-        Distilled 1-step models (DMD2, Hyper-SD, Lightning) are trained at
-        a specific timestep and produce garbage at any other one — letting
-        LCMScheduler pick the default would feed them ~t=979 (near max
-        noise) where they were never trained.
-        """
-        if self._timesteps_override is not None:
-            # Pin the override; still call set_timesteps so the scheduler
-            # internals (timestep_scaling, etc.) are populated for any
-            # downstream lookups.
-            self.scheduler.set_timesteps(
-                num_inference_steps, self.device, strength=strength
-            )
-            self.timesteps = torch.tensor(
-                self._timesteps_override, device=self.device, dtype=torch.long
-            )
-        else:
-            self.scheduler.set_timesteps(
-                num_inference_steps, self.device, strength=strength
-            )
-            self.timesteps = self.scheduler.timesteps.to(self.device)
-
-        # Make sub timesteps list
-        self.sub_timesteps = []
-        for t in self.t_list:
-            self.sub_timesteps.append(self.timesteps[t])
-
-        sub_timesteps_tensor = torch.tensor(
-            self.sub_timesteps, dtype=torch.long, device=self.device
-        )
-        self.sub_timesteps_tensor = torch.repeat_interleave(
-            sub_timesteps_tensor,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
-
-        # Calculate scaling factors
-        c_skip_list = []
-        c_out_list = []
-        for timestep in self.sub_timesteps:
-            c_skip, c_out = self.scheduler.get_scalings_for_boundary_condition_discrete(
-                timestep
-            )
-            c_skip_list.append(c_skip)
-            c_out_list.append(c_out)
-
-        self.c_skip = (
-            torch.stack(c_skip_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        self.c_out = (
-            torch.stack(c_out_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-
-        # Calculate alpha/beta values
-        alpha_prod_t_sqrt_list = []
-        beta_prod_t_sqrt_list = []
-        ac = self.scheduler.alphas_cumprod
-        last_idx = len(ac) - 1
-        for timestep in self.sub_timesteps:
-            # Clamp into range instead of skipping — skipping would make the
-            # downstream .view(len(t_list), 1, 1, 1) reshape fail when any
-            # timestep happened to land out of range for this scheduler.
-            idx = min(int(timestep), last_idx)
-            alpha_prod_t_sqrt_list.append(ac[idx].sqrt())
-            beta_prod_t_sqrt_list.append((1 - ac[idx]).sqrt())
-
-        alpha_prod_t_sqrt = (
-            torch.stack(alpha_prod_t_sqrt_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        beta_prod_t_sqrt = (
-            torch.stack(beta_prod_t_sqrt_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        self.alpha_prod_t_sqrt = torch.repeat_interleave(
-            alpha_prod_t_sqrt,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
-        self.beta_prod_t_sqrt = torch.repeat_interleave(
-            beta_prod_t_sqrt,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
-
-    def _initialize_noise(self):
-        """Initialize noise tensors."""
-        self.init_noise = torch.randn(
-            (self.batch_size, 4, self.latent_height, self.latent_width),
-            generator=self.generator,
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-        self.stock_noise = torch.zeros_like(self.init_noise)
-
-    def _setup_seed_transition(self, new_seed: int, total_steps: int) -> None:
-        """Begin a multi-frame lerp from the current init_noise to the new seed.
-
-        Falls back to a hard cut (re-seed + regenerate immediately) when
-        ``total_steps <= 0`` or no prior ``init_noise`` exists. The first
-        frame after this runs at the source noise; subsequent frames lerp
-        toward the target via :meth:`_advance_seed_transition`.
-        """
-        self._cancel_seed_transition()
-        if total_steps <= 0 or self.init_noise is None:
-            self.generator.manual_seed(new_seed)
-            self._last_seed = new_seed
-            self.x_t_latent_buffer = None
-            self._initialize_noise()
-            return
-
-        self._seed_transition_source = self.init_noise.detach().clone()
-        self.generator.manual_seed(new_seed)
-        self._seed_transition_target = torch.randn(
-            self.init_noise.shape,
-            generator=self.generator,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        self._seed_transition_progress = 0
-        self._seed_transition_total = total_steps
-        self._last_seed = new_seed
-        # Match the hard-cut path's stock_noise reset so the StreamDiffusion
-        # feedback term doesn't carry the previous seed's accumulator.
-        self.stock_noise = torch.zeros_like(self.init_noise)
-        self.x_t_latent_buffer = None
-
-    @staticmethod
-    def _slerp_noise(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
-        """Spherical interpolation between two noise tensors.
-
-        Linear interpolation drops the variance of standard-normal noise to
-        ``(1-t)² + t²`` mid-blend (0.5 at t=0.5), which the diffusion model
-        renders as washed-out / blurry output. Slerp keeps the result on the
-        same hypersphere as the endpoints, preserving variance and producing
-        a perceptually smooth crossfade between scenes.
-        """
-        a_flat = a.flatten().float()
-        b_flat = b.flatten().float()
-        a_norm = a_flat.norm()
-        b_norm = b_flat.norm()
-        cos_omega = (a_flat @ b_flat) / (a_norm * b_norm + 1e-8)
-        cos_omega = cos_omega.clamp(-1.0, 1.0)
-        omega = torch.acos(cos_omega)
-        sin_omega = torch.sin(omega)
-        # Collinear endpoints — degenerate to lerp to avoid divide-by-zero.
-        if sin_omega.abs() < 1e-6:
-            return torch.lerp(a, b, t)
-        w_a = torch.sin((1.0 - t) * omega) / sin_omega
-        w_b = torch.sin(t * omega) / sin_omega
-        return (w_a * a + w_b * b).to(dtype=a.dtype)
-
-    def _advance_seed_transition(self) -> None:
-        """Slerp ``init_noise`` one step toward the target. No-op when idle."""
-        if self._seed_transition_total <= 0:
-            return
-        self._seed_transition_progress += 1
-        if self._seed_transition_progress >= self._seed_transition_total:
-            self.init_noise = self._seed_transition_target.clone()
-            self._cancel_seed_transition()
-            return
-        t = self._seed_transition_progress / self._seed_transition_total
-        self.init_noise = self._slerp_noise(
-            self._seed_transition_source,
-            self._seed_transition_target,
-            t,
-        )
-
-    def _cancel_seed_transition(self) -> None:
-        """Drop any in-flight seed transition without snapping init_noise."""
-        self._seed_transition_source = None
-        self._seed_transition_target = None
-        self._seed_transition_progress = 0
-        self._seed_transition_total = 0
-
-
-    def _encode_image(
-        self, image_tensors: torch.Tensor, add_noise: bool = True
-    ) -> torch.Tensor:
-        """Encode image to latent space."""
-        # Convert from [0, 1] to [-1, 1] range as expected by VAE
-        image_tensors = image_tensors * 2.0 - 1.0
-        image_tensors = image_tensors.to(device=self.device, dtype=self.vae.dtype)
-        img_latent = retrieve_latents(self.vae.encode(image_tensors), None)
-        img_latent = img_latent * self.vae.config.scaling_factor
-        if add_noise:
-            img_latent = self._add_noise(
-                img_latent, self.init_noise[0], 0, strength=1.0
-            )
-        return img_latent
-
-    def _decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
-        """Decode latent to image."""
-        output_latent = self.vae.decode(
-            x_0_pred_out / self.vae.config.scaling_factor, return_dict=False
-        )[0]
-        return output_latent
-
-    def _add_noise(
-        self,
-        original_samples: torch.Tensor,
-        noise: torch.Tensor,
-        t_index: int,
-        strength: float = None,
-    ) -> torch.Tensor:
-        """Add noise to samples."""
-        if strength is None:
-            strength = self.strength
-
-        noisy_samples = self.alpha_prod_t_sqrt[t_index] * original_samples + (
-            self.beta_prod_t_sqrt[t_index] * noise * strength
-        )
-        return noisy_samples
-
-    def _scheduler_step_batch(
-        self,
-        model_pred_batch: torch.Tensor,
-        x_t_latent_batch: torch.Tensor,
-        added_cond_kwargs,  # noqa: ARG002
-        idx: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Perform a batch step in the scheduler."""
-        if idx is None:
-            F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch
-            ) / self.alpha_prod_t_sqrt
-            denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent_batch
-        else:
-            F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch
-            ) / self.alpha_prod_t_sqrt[idx]
-            denoised_batch = (
-                self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
-            )
-
-        return denoised_batch
-
-    def _unet_step(
-        self,
-        x_t_latent: torch.Tensor,
-        t_list: Union[torch.Tensor, List[int]],
-        added_cond_kwargs,
-        idx: Optional[int] = None,
-    ):
-        """Perform a single UNet denoising step."""
-        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
-            t_list = torch.concat([t_list[0:1], t_list], dim=0)
-        elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)
-            t_list = torch.concat([t_list, t_list], dim=0)
-        else:
-            x_t_latent_plus_uc = x_t_latent
-
-        # Compute ControlNet residuals if conditioning is available.
-        # This works for all paths — eager ControlNet, TRT ControlNet — they
-        # all expose the diffusers ControlNetModel signature.
-        down_block_res_samples = None
-        mid_block_res_sample = None
-        if self.controlnet is not None and self.controlnet_input is not None:
-            batch_size = x_t_latent_plus_uc.shape[0]
-            cond_image = self.controlnet_input.expand(batch_size, -1, -1, -1)
-            down_block_res_samples, mid_block_res_sample = self.controlnet(
-                x_t_latent_plus_uc,
-                t_list,
-                encoder_hidden_states=self.prompts.prompt_embeds,
-                controlnet_cond=cond_image,
-                conditioning_scale=self.controlnet_conditioning_scale,
-                return_dict=False,
-            )
-
-        model_pred = self.unet(
-            x_t_latent_plus_uc,
-            t_list,
-            encoder_hidden_states=self.prompts.prompt_embeds,
-            added_cond_kwargs=added_cond_kwargs,
-            down_block_additional_residuals=down_block_res_samples,
-            mid_block_additional_residual=mid_block_res_sample,
-            return_dict=False,
-        )[0]
-
-        # Compute denoised sample
-        if self.use_denoising_batch:
-            denoised_batch = self._scheduler_step_batch(
-                model_pred, x_t_latent, added_cond_kwargs, idx
-            )
-            if self.cfg_type == "self" or self.cfg_type == "initialize":
-                scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
-                delta_x = self._scheduler_step_batch(
-                    model_pred, scaled_noise, added_cond_kwargs, idx
-                )
-                alpha_next = torch.concat(
-                    [
-                        self.alpha_prod_t_sqrt[1:],
-                        torch.ones_like(self.alpha_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = alpha_next * delta_x
-                beta_next = torch.concat(
-                    [
-                        self.beta_prod_t_sqrt[1:],
-                        torch.ones_like(self.beta_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = delta_x / beta_next
-                init_noise = torch.concat(
-                    [self.init_noise[1:], self.init_noise[0:1]], dim=0
-                )
-                self.stock_noise = init_noise + delta_x
-        else:
-            denoised_batch = self._scheduler_step_batch(
-                model_pred, x_t_latent, added_cond_kwargs, idx
-            )
-
-        return denoised_batch, model_pred
-
-    def _predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
-        """Predict denoised latent from noisy latent."""
-        added_cond_kwargs = {}
-        prev_latent_batch = self.x_t_latent_buffer
-
-        if self.use_denoising_batch:
-            t_list = self.sub_timesteps_tensor
-            if self.sdxl:
-                batch = x_t_latent.shape[0]
-                te = self.prompts.add_text_embeds.to(self.device)
-                ti = self.prompts.add_time_ids.to(self.device)
-                if te.shape[0] != batch:
-                    te = te[:1].expand(batch, -1)
-                if ti.shape[0] != batch:
-                    ti = ti[:1].expand(batch, -1)
-                added_cond_kwargs = {"text_embeds": te, "time_ids": ti}
-
-            x_t_latent = x_t_latent.to(self.device)
-            t_list = t_list.to(self.device)
-            x_0_pred_batch, _model_pred = self._unet_step(
-                x_t_latent, t_list, added_cond_kwargs=added_cond_kwargs
-            )
-
-            x_0_pred_out = x_0_pred_batch
-            self.x_t_latent_buffer = None
-        else:
-            self.init_noise = x_t_latent
-            for idx, t in enumerate(self.sub_timesteps_tensor):
-                t = t.view(
-                    1,
-                ).repeat(
-                    self.frame_bff_size,
-                )
-                if self.sdxl:
-                    added_cond_kwargs = {
-                        "text_embeds": self.prompts.add_text_embeds.to(self.device),
-                        "time_ids": self.prompts.add_time_ids.to(self.device),
-                    }
-                x_0_pred, _model_pred = self._unet_step(
-                    x_t_latent, t, idx=idx, added_cond_kwargs=added_cond_kwargs
-                )
-                if idx < len(self.sub_timesteps_tensor) - 1:
-                    if self.do_add_noise:
-                        x_t_latent = self.alpha_prod_t_sqrt[
-                            idx + 1
-                        ] * x_0_pred + self.beta_prod_t_sqrt[
-                            idx + 1
-                        ] * torch.randn_like(
-                            x_0_pred, device=self.device, dtype=self.dtype
-                        )
-                    else:
-                        x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
-            x_0_pred_out = x_0_pred
-
-        return x_0_pred_out
 
     @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
@@ -1010,7 +623,7 @@ class StreamDiffusionPipeline(Pipeline):
             # Convert HWC -> CHW and add batch dimension: (H, W, C) -> (1, C, H, W)
             input_tensor = frame.permute(2, 0, 1).unsqueeze(0)
 
-            input_latent = self._encode_image(input_tensor, add_noise=True)
+            input_latent = self.inference.encode_image(input_tensor, add_noise=True)
 
         else:
             # Text-to-image mode — use the seeded `init_noise` instead of a
@@ -1018,11 +631,11 @@ class StreamDiffusionPipeline(Pipeline):
             # would generate a different scene; the seeded buffer keeps the
             # output stable across frames for the same seed (and lets the
             # user reseed deterministically by changing `seed`).
-            input_latent = self.init_noise[0:1].clone()
+            input_latent = self.inference.init_noise[0:1].clone()
 
-        x_0_pred_out = self._predict_x0_batch(input_latent)
+        x_0_pred_out = self.inference.predict_x0(input_latent)
         # Decode to image space
-        x_output = self._decode_image(x_0_pred_out).detach().clone()
+        x_output = self.inference.decode_image(x_0_pred_out).detach().clone()
         # Normalize from [-1, 1] to [0, 1] (VAE outputs in range [-1, 1])
         x_output = (x_output / 2 + 0.5).clamp(0, 1)
         # Convert back to Scope format: (B, C, H, W) -> (T, H, W, C)
