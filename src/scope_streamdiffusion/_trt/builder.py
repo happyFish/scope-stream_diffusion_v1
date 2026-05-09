@@ -82,6 +82,14 @@ class EngineBuilder:
                 onnx_opt_path=onnx_opt_path,
                 model_data=self.model,
             )
+        # Propagate to *both* the latent and image shape envelopes. Updating
+        # only the latent side leaves controlnet_cond / VAE-image inputs at
+        # the BaseModel default (256–1024), which TRT then rejects as
+        # inconsistent with sample/latent (cask convolution assertion in
+        # convBaseBuilder.cpp::createConvolution). Caller already passes the
+        # range as image-space resolution; latent = image // 8.
+        self.model.min_image_shape = min_image_resolution
+        self.model.max_image_shape = max_image_resolution
         self.model.min_latent_shape = min_image_resolution // 8
         self.model.max_latent_shape = max_image_resolution // 8
         if not force_engine_build and os.path.exists(engine_path):

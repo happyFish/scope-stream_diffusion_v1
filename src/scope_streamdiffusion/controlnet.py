@@ -16,10 +16,19 @@ from diffusers import ControlNetModel
 # Detected at runtime on first depth call.
 _HAS_GPU_DEPTH: bool | None = None
 
-# ControlNet model IDs keyed by controlnet_mode
+# ControlNet model IDs keyed by controlnet_mode (SD 1.5 / 2.x family).
 MODEL_IDS: dict[str, str] = {
     "depth": "https://huggingface.co/thibaud/controlnet-sd21/resolve/main/control_v11p_sd21_depth.safetensors",
     "scribble": "https://huggingface.co/thibaud/controlnet-sd21/resolve/main/control_v11p_sd21_scribble.safetensors",
+}
+
+# SDXL ControlNet variants — selected when the host pipeline is SDXL. SDXL
+# ControlNets are architecturally different (cross_attention_dim=2048, three
+# down blocks instead of four, SDXL aug-conditioning inputs), so they aren't
+# interchangeable with the SD 1.5/2.x weights above.
+SDXL_MODEL_IDS: dict[str, str] = {
+    "depth": "diffusers/controlnet-depth-sdxl-1.0",
+    "scribble": "xinsir/controlnet-scribble-sdxl-1.0",
 }
 
 _SCRIBBLE_CHECKPOINT = "VACE-Annotators/scribble/anime_style/netG_A_latest.pth"
@@ -51,7 +60,11 @@ class ControlNetHandler:
     def __init__(self, device: torch.device, dtype: torch.dtype):
         self.device = device
         self.dtype = dtype
-        self._controlnet_cache: dict[str, ControlNetModel] = {}
+        # Cache key is (sdxl, mode) — SDXL and SD1.5 share the same mode names
+        # ("depth", "scribble") but resolve to different weights, so we can't
+        # collapse them.
+        self._controlnet_cache: dict[tuple[bool, str], ControlNetModel] = {}
+        self._sdxl: bool = False
         self._depth_model = None
         self._depth_hidden_state = None
         self._last_depth_shape: tuple[int, int] | None = None
@@ -315,15 +328,35 @@ class ControlNetHandler:
                 )
             self._prev_scribble_input = self.input
 
+    def set_sdxl(self, sdxl: bool) -> None:
+        """Toggle SDXL routing for ``_get_model_for_mode``.
+
+        Called by the pipeline at load / swap time. Switching SDXL ↔ SD1.5
+        with a controlnet active does not invalidate the cache (entries are
+        keyed by ``(sdxl, mode)``); the next ``update()`` will load the right
+        weights for the new host.
+        """
+        self._sdxl = bool(sdxl)
+
     def _get_model_for_mode(self, mode: str) -> ControlNetModel:
-        if mode not in self._controlnet_cache:
-            model_id = MODEL_IDS[mode]
-            print(f"[ControlNet] Loading {mode} model: {model_id}")
+        cache_key = (self._sdxl, mode)
+        if cache_key not in self._controlnet_cache:
+            ids = SDXL_MODEL_IDS if self._sdxl else MODEL_IDS
+            if mode not in ids:
+                raise ValueError(
+                    f"[ControlNet] No {'SDXL' if self._sdxl else 'SD1.5/2.x'} "
+                    f"weights registered for mode={mode!r}"
+                )
+            model_id = ids[mode]
+            print(
+                f"[ControlNet] Loading {mode} model "
+                f"({'SDXL' if self._sdxl else 'SD1.5/2.x'}): {model_id}"
+            )
             model = self._load_controlnet(model_id).to(self.device)
             model.eval()
-            self._controlnet_cache[mode] = model
-            print(f"[ControlNet] {mode} model cached")
-        return self._controlnet_cache[mode]
+            self._controlnet_cache[cache_key] = model
+            print(f"[ControlNet] {mode} model cached (sdxl={self._sdxl})")
+        return self._controlnet_cache[cache_key]
 
     def _get_depth_preprocessor(self):
         if self._depth_model is None:

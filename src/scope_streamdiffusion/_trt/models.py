@@ -801,6 +801,479 @@ class UNetWithControlInputs(BaseModel):
         return (sample, ts, ehs, *controls, mid_residual)
 
 
+class ControlNetSDXLExportWrapper(torch.nn.Module):
+    """ONNX export wrapper for an SDXL ControlNetModel.
+
+    Mirrors :class:`ControlNetExportWrapper` but threads SDXL aug-
+    conditioning (``text_embeds`` + ``time_ids``) through the
+    ``added_cond_kwargs`` dict the diffusers SDXL ControlNet expects.
+    """
+
+    def __init__(self, controlnet, num_down_residuals: int):
+        super().__init__()
+        self.controlnet = controlnet
+        self.num_down_residuals = num_down_residuals
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        controlnet_cond,
+        controlnet_scale,
+        text_embeds,
+        time_ids,
+    ):
+        down_samples, mid_sample = self.controlnet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_cond,
+            added_cond_kwargs={"text_embeds": text_embeds, "time_ids": time_ids},
+            return_dict=False,
+        )
+        scaled_down = [d * controlnet_scale for d in down_samples]
+        scaled_mid = mid_sample * controlnet_scale
+        return (*scaled_down, scaled_mid)
+
+
+class ControlNetSDXL(BaseModel):
+    """TRT I/O spec for a standalone SDXL ControlNet engine.
+
+    Inputs: sample, timestep, encoder_hidden_states (B,77,2048),
+            controlnet_cond, controlnet_scale, text_embeds (B,1280),
+            time_ids (B,6).
+    Outputs: down_block_res_sample_0..N-1, mid_block_res_sample.
+
+    SDXL ControlNet (e.g. ``diffusers/controlnet-canny-sdxl-1.0``) has
+    ``block_out_channels=(320, 640, 1280)`` — one fewer block than SD1.5 —
+    producing 9 down residuals + 1 mid.
+    """
+
+    def __init__(
+        self,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=2048,
+        text_maxlen=77,
+        unet_dim=4,
+        num_down_residuals=9,
+        block_out_channels=(320, 640, 1280),
+        text_embeds_dim=1280,
+        time_ids_dim=6,
+    ):
+        super(ControlNetSDXL, self).__init__(
+            fp16=fp16,
+            device=device,
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim,
+            text_maxlen=text_maxlen,
+        )
+        self.unet_dim = unet_dim
+        self.num_down_residuals = num_down_residuals
+        self.block_out_channels = tuple(block_out_channels)
+        self.text_embeds_dim = text_embeds_dim
+        self.time_ids_dim = time_ids_dim
+        self.name = "ControlNetSDXL"
+
+    def _residual_spec(self):
+        """(channels, downsample-from-latent) per down residual + implicit mid."""
+        chans = self.block_out_channels
+        # SDXL UNet residual emission with 3 down blocks (block 0 = DownBlock2D
+        # plain, blocks 1-2 = CrossAttnDownBlock2D), layers_per_block=2, blocks
+        # 0-1 with downsampler, block 2 without:
+        #   conv_in:                   chans[0] @ ds=1   (residual 0)
+        #   block 0 layer 0..1:        chans[0] @ ds=1   (residuals 1,2)
+        #   block 0 downsample:        chans[0] @ ds=2   (residual 3)
+        #   block 1 layer 0..1:        chans[1] @ ds=2   (residuals 4,5)
+        #   block 1 downsample:        chans[1] @ ds=4   (residual 6)
+        #   block 2 layer 0..1:        chans[2] @ ds=4   (residuals 7,8)
+        #   mid:                       chans[2] @ ds=4
+        if len(chans) == 3 and self.num_down_residuals == 9:
+            return [
+                (chans[0], 1), (chans[0], 1), (chans[0], 1),
+                (chans[0], 2), (chans[1], 2), (chans[1], 2),
+                (chans[1], 4), (chans[2], 4), (chans[2], 4),
+            ]
+        return [(chans[0], 1)] * self.num_down_residuals
+
+    def get_input_names(self):
+        return [
+            "sample",
+            "timestep",
+            "encoder_hidden_states",
+            "controlnet_cond",
+            "controlnet_scale",
+            "text_embeds",
+            "time_ids",
+        ]
+
+    def get_output_names(self):
+        return [
+            f"down_block_res_sample_{i}" for i in range(self.num_down_residuals)
+        ] + ["mid_block_res_sample"]
+
+    def get_dynamic_axes(self):
+        axes = {
+            "sample": {0: "2B", 2: "H", 3: "W"},
+            "timestep": {0: "2B"},
+            "encoder_hidden_states": {0: "2B"},
+            "controlnet_cond": {0: "2B", 2: "8H", 3: "8W"},
+            "text_embeds": {0: "2B"},
+            "time_ids": {0: "2B"},
+            "mid_block_res_sample": {0: "2B"},
+        }
+        for i in range(self.num_down_residuals):
+            axes[f"down_block_res_sample_{i}"] = {0: "2B"}
+        return axes
+
+    def get_input_profile(
+        self, batch_size, image_height, image_width, static_batch, static_shape
+    ):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        (
+            min_batch,
+            max_batch,
+            min_image_height,
+            max_image_height,
+            min_image_width,
+            max_image_width,
+            min_latent_height,
+            max_latent_height,
+            min_latent_width,
+            max_latent_width,
+        ) = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape
+        )
+        return {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+            "controlnet_cond": [
+                (min_batch, 3, min_image_height, min_image_width),
+                (batch_size, 3, image_height, image_width),
+                (max_batch, 3, max_image_height, max_image_width),
+            ],
+            "controlnet_scale": [(1,), (1,), (1,)],
+            "text_embeds": [
+                (min_batch, self.text_embeds_dim),
+                (batch_size, self.text_embeds_dim),
+                (max_batch, self.text_embeds_dim),
+            ],
+            "time_ids": [
+                (min_batch, self.time_ids_dim),
+                (batch_size, self.time_ids_dim),
+                (max_batch, self.time_ids_dim),
+            ],
+        }
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        d = {
+            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (2 * batch_size,),
+            "encoder_hidden_states": (
+                2 * batch_size, self.text_maxlen, self.embedding_dim,
+            ),
+            "controlnet_cond": (2 * batch_size, 3, image_height, image_width),
+            "controlnet_scale": (1,),
+            "text_embeds": (2 * batch_size, self.text_embeds_dim),
+            "time_ids": (2 * batch_size, self.time_ids_dim),
+            "mid_block_res_sample": (
+                2 * batch_size, self.block_out_channels[-1],
+                max(1, latent_height // 4), max(1, latent_width // 4),
+            ),
+        }
+        for i, (c, ds) in enumerate(self._residual_spec()):
+            d[f"down_block_res_sample_{i}"] = (
+                2 * batch_size, c,
+                max(1, latent_height // ds), max(1, latent_width // ds),
+            )
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        dtype = torch.float16 if self.fp16 else torch.float32
+        return (
+            torch.randn(
+                2 * batch_size, self.unet_dim, latent_height, latent_width,
+                dtype=torch.float32, device=self.device,
+            ),
+            torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
+            torch.randn(
+                2 * batch_size, self.text_maxlen, self.embedding_dim,
+                dtype=dtype, device=self.device,
+            ),
+            torch.randn(
+                2 * batch_size, 3, image_height, image_width,
+                dtype=torch.float32, device=self.device,
+            ),
+            torch.tensor([1.0], dtype=torch.float32, device=self.device),
+            torch.randn(
+                2 * batch_size, self.text_embeds_dim,
+                dtype=dtype, device=self.device,
+            ),
+            torch.randn(
+                2 * batch_size, self.time_ids_dim,
+                dtype=dtype, device=self.device,
+            ),
+        )
+
+
+class UNetSDXLExportWrapperWithControl(torch.nn.Module):
+    """Wraps the SDXL UNet so SDXL aug + ControlNet residuals are positional.
+
+    ONNX export needs positional inputs. We reconstruct
+    ``added_cond_kwargs={"text_embeds", "time_ids"}`` and unpack the trailing
+    control inputs into ``down_block_additional_residuals`` /
+    ``mid_block_additional_residual`` that diffusers' SDXL UNet accepts.
+    """
+
+    def __init__(self, unet, num_down_residuals: int):
+        super().__init__()
+        self.unet = unet
+        self.num_down_residuals = num_down_residuals
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        text_embeds,
+        time_ids,
+        *control_inputs,
+    ):
+        down_residuals = list(control_inputs[: self.num_down_residuals])
+        mid_residual = control_inputs[self.num_down_residuals]
+        out = self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            added_cond_kwargs={"text_embeds": text_embeds, "time_ids": time_ids},
+            down_block_additional_residuals=down_residuals,
+            mid_block_additional_residual=mid_residual,
+            return_dict=False,
+        )
+        return out[0]
+
+
+class UNetSDXLWithControlInputs(BaseModel):
+    """TRT I/O spec for the SDXL UNet with ControlNet residual inputs.
+
+    Inputs (ordered — must match the export wrapper's positional order):
+      sample, timestep, encoder_hidden_states (B,77,2048),
+      text_embeds (B,1280), time_ids (B,6),
+      input_control_00..N-1 (down residuals), input_control_middle.
+
+    Output: latent.
+
+    SDXL UNet residual layout (3 down blocks, layers_per_block=2, blocks
+    0-1 with downsampler, block 2 without):
+      block 0: 320ch @ H/8 (3 residuals incl. conv_in)
+      block 0 ds → block 1: 320 then 640ch @ H/16 (3 residuals)
+      block 1 ds → block 2: 640 then 1280ch @ H/32 (3 residuals)
+      mid: 1280ch @ H/32
+    Total: 9 down residuals + 1 mid.
+    """
+
+    def __init__(
+        self,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=2048,
+        text_maxlen=77,
+        unet_dim=4,
+        num_down_residuals=9,
+        block_out_channels=(320, 640, 1280),
+        text_embeds_dim=1280,
+        time_ids_dim=6,
+    ):
+        super(UNetSDXLWithControlInputs, self).__init__(
+            fp16=fp16, device=device,
+            max_batch_size=max_batch_size, min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim, text_maxlen=text_maxlen,
+        )
+        self.unet_dim = unet_dim
+        self.num_down_residuals = num_down_residuals
+        self.block_out_channels = tuple(block_out_channels)
+        self.text_embeds_dim = text_embeds_dim
+        self.time_ids_dim = time_ids_dim
+        self.name = "UNetSDXLWithControlInputs"
+
+    def _residual_spec(self):
+        chans = self.block_out_channels
+        if len(chans) == 3 and self.num_down_residuals == 9:
+            return [
+                (chans[0], 1), (chans[0], 1), (chans[0], 1),
+                (chans[0], 2), (chans[1], 2), (chans[1], 2),
+                (chans[1], 4), (chans[2], 4), (chans[2], 4),
+            ]
+        return [(chans[0], 1)] * self.num_down_residuals
+
+    def get_input_names(self):
+        return [
+            "sample", "timestep", "encoder_hidden_states",
+            "text_embeds", "time_ids",
+        ] + [f"input_control_{i:02d}" for i in range(self.num_down_residuals)] + [
+            "input_control_middle"
+        ]
+
+    def get_output_names(self):
+        return ["latent"]
+
+    def get_dynamic_axes(self):
+        axes = {
+            "sample": {0: "2B", 2: "H", 3: "W"},
+            "timestep": {0: "2B"},
+            "encoder_hidden_states": {0: "2B"},
+            "text_embeds": {0: "2B"},
+            "time_ids": {0: "2B"},
+            "latent": {0: "2B", 2: "H", 3: "W"},
+            # mid resolution differs from SD1.5 (chans[-1] @ /4 of latent here).
+            "input_control_middle": {0: "2B", 2: "Hm", 3: "Wm"},
+        }
+        for i in range(self.num_down_residuals):
+            axes[f"input_control_{i:02d}"] = {0: "2B", 2: f"Hc{i}", 3: f"Wc{i}"}
+        return axes
+
+    def get_input_profile(
+        self, batch_size, image_height, image_width, static_batch, static_shape
+    ):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        (
+            min_batch, max_batch,
+            min_image_height, max_image_height,
+            min_image_width, max_image_width,
+            min_latent_height, max_latent_height,
+            min_latent_width, max_latent_width,
+        ) = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape
+        )
+
+        profile = {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+            "text_embeds": [
+                (min_batch, self.text_embeds_dim),
+                (batch_size, self.text_embeds_dim),
+                (max_batch, self.text_embeds_dim),
+            ],
+            "time_ids": [
+                (min_batch, self.time_ids_dim),
+                (batch_size, self.time_ids_dim),
+                (max_batch, self.time_ids_dim),
+            ],
+        }
+        spec = self._residual_spec()
+        for i, (c, ds) in enumerate(spec):
+            profile[f"input_control_{i:02d}"] = [
+                (min_batch, c, max(1, min_latent_height // ds), max(1, min_latent_width // ds)),
+                (batch_size, c, max(1, latent_height // ds), max(1, latent_width // ds)),
+                (max_batch, c, max(1, max_latent_height // ds), max(1, max_latent_width // ds)),
+            ]
+        # SDXL mid lives at /4 of latent (vs /8 for SD1.5 because SDXL has one
+        # fewer down-block).
+        mid_ch = self.block_out_channels[-1]
+        profile["input_control_middle"] = [
+            (min_batch, mid_ch, max(1, min_latent_height // 4), max(1, min_latent_width // 4)),
+            (batch_size, mid_ch, max(1, latent_height // 4), max(1, latent_width // 4)),
+            (max_batch, mid_ch, max(1, max_latent_height // 4), max(1, max_latent_width // 4)),
+        ]
+        return profile
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        d = {
+            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (2 * batch_size,),
+            "encoder_hidden_states": (
+                2 * batch_size, self.text_maxlen, self.embedding_dim,
+            ),
+            "text_embeds": (2 * batch_size, self.text_embeds_dim),
+            "time_ids": (2 * batch_size, self.time_ids_dim),
+            "latent": (2 * batch_size, 4, latent_height, latent_width),
+            "input_control_middle": (
+                2 * batch_size, self.block_out_channels[-1],
+                max(1, latent_height // 4), max(1, latent_width // 4),
+            ),
+        }
+        for i, (c, ds) in enumerate(self._residual_spec()):
+            d[f"input_control_{i:02d}"] = (
+                2 * batch_size, c,
+                max(1, latent_height // ds), max(1, latent_width // ds),
+            )
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(
+            batch_size, image_height, image_width
+        )
+        dtype = torch.float16 if self.fp16 else torch.float32
+        sample = torch.randn(
+            2 * batch_size, self.unet_dim, latent_height, latent_width,
+            dtype=torch.float32, device=self.device,
+        )
+        ts = torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device)
+        ehs = torch.randn(
+            2 * batch_size, self.text_maxlen, self.embedding_dim,
+            dtype=dtype, device=self.device,
+        )
+        text_embeds = torch.randn(
+            2 * batch_size, self.text_embeds_dim, dtype=dtype, device=self.device,
+        )
+        time_ids = torch.randn(
+            2 * batch_size, self.time_ids_dim, dtype=dtype, device=self.device,
+        )
+        controls = []
+        for c, ds in self._residual_spec():
+            controls.append(
+                torch.randn(
+                    2 * batch_size, c,
+                    max(1, latent_height // ds), max(1, latent_width // ds),
+                    dtype=dtype, device=self.device,
+                )
+            )
+        mid_ch = self.block_out_channels[-1]
+        mid_residual = torch.randn(
+            2 * batch_size, mid_ch,
+            max(1, latent_height // 4), max(1, latent_width // 4),
+            dtype=dtype, device=self.device,
+        )
+        return (sample, ts, ehs, text_embeds, time_ids, *controls, mid_residual)
+
+
 class VAE(BaseModel):
     def __init__(self, device, max_batch_size, min_batch_size=1):
         super(VAE, self).__init__(

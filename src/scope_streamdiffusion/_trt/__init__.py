@@ -23,8 +23,10 @@ from .builder import EngineBuilder, create_onnx_path
 from .engine import (
     AutoencoderKLEngine,
     ControlNetEngine,
+    ControlNetSDXLEngine,
     UNet2DConditionModelEngine,
     UNet2DConditionModelSDXLEngine,
+    UNet2DConditionModelSDXLWithControlEngine,
     UNet2DConditionModelWithControlEngine,
 )
 from .models import (
@@ -32,10 +34,14 @@ from .models import (
     BaseModel,
     ControlNet,
     ControlNetExportWrapper,
+    ControlNetSDXL,
+    ControlNetSDXLExportWrapper,
     UNet,
     UNetExportWrapperWithControl,
     UNetSDXL,
     UNetSDXLExportWrapper,
+    UNetSDXLExportWrapperWithControl,
+    UNetSDXLWithControlInputs,
     UNetWithControlInputs,
     VAEEncoder,
 )
@@ -107,23 +113,31 @@ __all__ = [
     "ControlNet",
     "ControlNetEngine",
     "ControlNetExportWrapper",
+    "ControlNetSDXL",
+    "ControlNetSDXLEngine",
+    "ControlNetSDXLExportWrapper",
     "Engine",
     "EngineBuilder",
     "TorchVAEEncoder",
     "UNet",
     "UNet2DConditionModelEngine",
     "UNet2DConditionModelSDXLEngine",
+    "UNet2DConditionModelSDXLWithControlEngine",
     "UNet2DConditionModelWithControlEngine",
     "UNetExportWrapperWithControl",
     "UNetSDXL",
     "UNetSDXLExportWrapper",
+    "UNetSDXLExportWrapperWithControl",
+    "UNetSDXLWithControlInputs",
     "UNetWithControlInputs",
     "VAE",
     "VAEEncoder",
     "build_engine",
     "compile_controlnet",
+    "compile_controlnet_sdxl",
     "compile_unet",
     "compile_unet_sdxl",
+    "compile_unet_sdxl_with_control",
     "compile_unet_with_control",
     "compile_vae_decoder",
     "compile_vae_encoder",
@@ -220,6 +234,67 @@ def compile_controlnet(
     builder.build(
         onnx_path, onnx_opt_path, engine_path,
         opt_batch_size=opt_batch_size, **engine_build_options,
+    )
+
+
+def compile_controlnet_sdxl(
+    controlnet,
+    model_data: BaseModel,
+    onnx_path: str,
+    onnx_opt_path: str,  # noqa: ARG001 — symmetry with compile_unet_sdxl
+    engine_path: str,
+    opt_batch_size: int = 1,
+    engine_build_options: dict = {},
+):
+    """Build a standalone TRT engine for an SDXL ControlNet.
+
+    SDXL ControlNet exports run ~2 GB ONNX and tend to OOM the polygraphy
+    optimizer's shape-inference pass on a 32 GB host (same failure mode as
+    SDXL UNet). Skip it via the same trick used in :func:`compile_unet_sdxl`
+    — pass the same path twice so the EngineBuilder feeds the raw export
+    straight to TRT.
+    """
+    num_down = getattr(model_data, "num_down_residuals", 9)
+    wrapped = ControlNetSDXLExportWrapper(controlnet, num_down).to(
+        torch.device("cuda"), dtype=torch.float16
+    ).eval()
+    builder = EngineBuilder(model_data, wrapped, device=torch.device("cuda"))
+    builder.build(
+        onnx_path, onnx_path, engine_path,  # same path twice: skip polygraphy
+        opt_batch_size=opt_batch_size,
+        use_external_data=True,
+        **engine_build_options,
+    )
+
+
+def compile_unet_sdxl_with_control(
+    unet,
+    model_data: BaseModel,
+    onnx_path: str,
+    onnx_opt_path: str,  # noqa: ARG001 — symmetry with compile_unet_sdxl
+    engine_path: str,
+    opt_batch_size: int = 1,
+    engine_build_options: dict = {},
+):
+    """Build a TRT engine for SDXL UNet + ControlNet residual input slots.
+
+    Combines the SDXL aug-conditioning inputs (text_embeds + time_ids) with
+    the ControlNet residual inputs. ONNX peaks at ~6 GB (SDXL UNet ~5 GB +
+    residual feature maps), so:
+      * use external-data ONNX format (required for >2 GB graphs);
+      * skip the polygraphy ONNX optimizer (would OOM on this size).
+    Build time on a 4090: 5–15 minutes; cache aggressively.
+    """
+    num_down = getattr(model_data, "num_down_residuals", 9)
+    wrapped = UNetSDXLExportWrapperWithControl(unet, num_down).to(
+        torch.device("cuda"), dtype=torch.float16
+    ).eval()
+    builder = EngineBuilder(model_data, wrapped, device=torch.device("cuda"))
+    builder.build(
+        onnx_path, onnx_path, engine_path,  # skip polygraphy optimizer
+        opt_batch_size=opt_batch_size,
+        use_external_data=True,
+        **engine_build_options,
     )
 
 

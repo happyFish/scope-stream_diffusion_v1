@@ -221,6 +221,9 @@ class StreamDiffusionPipeline(Pipeline):
         self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
         if self.sdxl and self.dtype == torch.float16:
             self.model_loader.install_sdxl_fp16_vae()
+        # ControlNet handler routes to SDXL-specific weights when the host
+        # pipeline is SDXL (depth/scribble names map to different repos).
+        self._cn.set_sdxl(self.sdxl)
 
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet

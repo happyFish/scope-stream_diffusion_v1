@@ -510,6 +510,323 @@ class TRTUNetSDXLAdapter:
         return self
 
 
+def build_unet_sdxl_with_control_engine(
+    unet: UNet2DConditionModel,
+    *,
+    model_id: str,
+    controlnet_id: str,
+    image_height: int = 1024,
+    image_width: int = 1024,
+    min_batch_size: int = 1,
+    max_batch_size: int = 1,
+    min_image_resolution: int = 512,
+    max_image_resolution: int = 1024,
+    num_down_residuals: int = 9,
+    block_out_channels: tuple[int, ...] = (320, 640, 1280),
+) -> Path:
+    """Build (or reuse) a TRT engine for SDXL UNet + ControlNet residuals.
+
+    Combines the SDXL aug-conditioning inputs (text_embeds, time_ids) with
+    ControlNet residual input slots so the SDXL+ControlNet path runs end-
+    to-end on TRT. Cache key includes both base model_id and controlnet_id
+    because the engine bakes the residual layout — swapping ControlNets
+    that share a residual spec is fine as long as block_out_channels match.
+
+    Static batch (max=1) plus a tight resolution envelope (512–1024) to
+    keep the builder under a 24 GB workspace ceiling — the combined graph
+    is ~6 GB ONNX and TRT's tactic search blows past tighter budgets.
+    """
+    from ._trt import (
+        UNetSDXLWithControlInputs,
+        compile_unet_sdxl_with_control,
+        create_onnx_path,
+    )
+
+    suffix = (
+        f"unet_sdxl_ctrl_b{min_batch_size}-{max_batch_size}_"
+        f"h{min_image_resolution}-{max_image_resolution}_"
+        f"w{min_image_resolution}-{max_image_resolution}"
+    )
+    cache_dir = _model_cache_dir(f"{model_id}::{controlnet_id}", suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "unet_sdxl_ctrl.engine"
+
+    if engine_path.exists():
+        logger.info(f"[TRT] Reusing cached SDXL UNet+ctrl engine: {engine_path}")
+        return engine_path
+
+    logger.info(f"[TRT] Building SDXL UNet+ctrl engine -> {engine_path} (5-15 min)")
+
+    model_data = UNetSDXLWithControlInputs(
+        fp16=True,
+        device=str(unet.device) if unet.device.type != "meta" else "cuda",
+        max_batch_size=max_batch_size,
+        min_batch_size=min_batch_size,
+        embedding_dim=unet.config.cross_attention_dim,
+        unet_dim=unet.config.in_channels,
+        num_down_residuals=num_down_residuals,
+        block_out_channels=tuple(block_out_channels),
+    )
+    compile_unet_sdxl_with_control(
+        unet, model_data,
+        str(create_onnx_path("unet_sdxl_ctrl", str(onnx_dir), opt=False)),
+        str(create_onnx_path("unet_sdxl_ctrl", str(onnx_dir), opt=True)),
+        str(engine_path),
+        opt_batch_size=min_batch_size,
+        engine_build_options={
+            "build_dynamic_shape": True,
+            "build_static_batch": True,
+            "opt_image_height": image_height,
+            "opt_image_width": image_width,
+            "min_image_resolution": min_image_resolution,
+            "max_image_resolution": max_image_resolution,
+        },
+    )
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    logger.info(f"[TRT] SDXL UNet+ctrl engine built: {engine_path}")
+    return engine_path
+
+
+def build_controlnet_sdxl_engine(
+    controlnet,
+    *,
+    model_id: str,
+    controlnet_id: str,
+    image_height: int = 1024,
+    image_width: int = 1024,
+    min_batch_size: int = 1,
+    max_batch_size: int = 1,
+    min_image_resolution: int = 512,
+    max_image_resolution: int = 1024,
+) -> Path:
+    """Build (or reuse) a standalone TRT engine for an SDXL ControlNet.
+
+    Mirrors :func:`build_controlnet_engine` but with SDXL aug-conditioning
+    inputs and the SDXL residual layout (9 down + 1 mid). Engine bakes the
+    ControlNet's ``block_out_channels`` and residual count, so each
+    SDXL ControlNet checkpoint gets its own cache slot keyed by
+    ``model_id::controlnet_id``.
+    """
+    from ._trt import ControlNetSDXL, compile_controlnet_sdxl, create_onnx_path
+
+    suffix = (
+        f"cn_sdxl_b{min_batch_size}-{max_batch_size}_"
+        f"h{min_image_resolution}-{max_image_resolution}_"
+        f"w{min_image_resolution}-{max_image_resolution}"
+    )
+    cache_dir = _model_cache_dir(f"{model_id}::{controlnet_id}", suffix)
+    onnx_dir = cache_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = cache_dir / "controlnet_sdxl.engine"
+
+    if engine_path.exists():
+        logger.info(f"[TRT] Reusing cached SDXL ControlNet engine: {engine_path}")
+        return engine_path
+
+    logger.info(f"[TRT] Building SDXL ControlNet engine -> {engine_path} (5-10 min)")
+
+    block_out_channels = tuple(controlnet.config.block_out_channels)
+    # SDXL ControlNet emits 9 down residuals (3 blocks × 3) — see
+    # ControlNetSDXL._residual_spec for the exact layout.
+    num_down_residuals = 9
+
+    model_data = ControlNetSDXL(
+        fp16=True,
+        device="cuda",
+        max_batch_size=max_batch_size,
+        min_batch_size=min_batch_size,
+        embedding_dim=controlnet.config.cross_attention_dim,
+        unet_dim=4,
+        num_down_residuals=num_down_residuals,
+        block_out_channels=block_out_channels,
+    )
+    compile_controlnet_sdxl(
+        controlnet, model_data,
+        str(create_onnx_path("controlnet_sdxl", str(onnx_dir), opt=False)),
+        str(create_onnx_path("controlnet_sdxl", str(onnx_dir), opt=True)),
+        str(engine_path),
+        opt_batch_size=min_batch_size,
+        engine_build_options={
+            "build_dynamic_shape": True,
+            "build_static_batch": True,
+            "opt_image_height": image_height,
+            "opt_image_width": image_width,
+            "min_image_resolution": min_image_resolution,
+            "max_image_resolution": max_image_resolution,
+        },
+    )
+    import shutil
+    if onnx_dir.exists():
+        shutil.rmtree(onnx_dir, ignore_errors=True)
+    logger.info(f"[TRT] SDXL ControlNet engine built: {engine_path}")
+    return engine_path
+
+
+class TRTUNetSDXLWithControlAdapter:
+    """Drop-in for diffusers SDXL UNet that also forwards ControlNet residuals.
+
+    Combines the SDXL aug-conditioning kwargs (text_embeds, time_ids) with
+    the down/mid residual slots — covers the SDXL+ControlNet inference
+    path so `_unet_step` doesn't need to branch on backend.
+    """
+
+    def __init__(
+        self,
+        engine_path: Path,
+        cuda_stream,
+        *,
+        num_down_residuals: int = 9,
+        use_cuda_graph: bool = False,
+    ):
+        from ._trt import UNet2DConditionModelSDXLWithControlEngine
+        self.engine = UNet2DConditionModelSDXLWithControlEngine(
+            str(engine_path), cuda_stream,
+            num_down_residuals=num_down_residuals,
+            use_cuda_graph=use_cuda_graph,
+        )
+        self.num_down_residuals = num_down_residuals
+        self._use_cuda_graph = use_cuda_graph
+        self.config = _ConfigShim(sdxl=True)
+        # SDXL pipelines read add_embedding.linear_1.in_features
+        # (see TRTUNetSDXLAdapter for the same shim).
+        class _AddEmbeddingShim:
+            class _Linear1Shim:
+                in_features = 2816
+            linear_1 = _Linear1Shim()
+        self.add_embedding = _AddEmbeddingShim()
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        added_cond_kwargs: dict | None = None,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+
+        if (
+            added_cond_kwargs is None
+            or "text_embeds" not in added_cond_kwargs
+            or "time_ids" not in added_cond_kwargs
+        ):
+            raise RuntimeError(
+                "TRTUNetSDXLWithControlAdapter requires added_cond_kwargs "
+                "with 'text_embeds' and 'time_ids'."
+            )
+        if down_block_additional_residuals is None or mid_block_additional_residual is None:
+            raise RuntimeError(
+                "TRTUNetSDXLWithControlAdapter requires ControlNet residuals."
+            )
+
+        out = self.engine(
+            latent_model_input=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            text_embeds=added_cond_kwargs["text_embeds"],
+            time_ids=added_cond_kwargs["time_ids"],
+            down_block_residuals=list(down_block_additional_residuals),
+            mid_block_residual=mid_block_additional_residual,
+        )
+        if return_dict:
+            return out
+        return (out.sample,)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+
+class TRTControlNetSDXLAdapter:
+    """Drop-in for diffusers SDXL ControlNetModel.
+
+    Mirrors :class:`TRTControlNetAdapter` but threads the SDXL aug-
+    conditioning kwargs through to the engine.
+    """
+
+    def __init__(
+        self,
+        engine_path: Path,
+        cuda_stream,
+        *,
+        num_down_residuals: int = 9,
+        block_out_channels: tuple[int, ...] = (320, 640, 1280),
+    ):
+        from ._trt import ControlNetSDXLEngine
+        self.engine = ControlNetSDXLEngine(
+            str(engine_path), cuda_stream,
+            num_down_residuals=num_down_residuals,
+            block_out_channels=block_out_channels,
+        )
+        self.config = _ConfigShim(sdxl=True)
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
+        conditioning_scale=1.0,
+        added_cond_kwargs: dict | None = None,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep.unsqueeze(0)
+
+        if isinstance(conditioning_scale, torch.Tensor):
+            scale = conditioning_scale.to(torch.float32)
+            if scale.ndim == 0:
+                scale = scale.unsqueeze(0)
+        else:
+            scale = torch.tensor(
+                [float(conditioning_scale)], dtype=torch.float32, device=sample.device,
+            )
+
+        if (
+            added_cond_kwargs is None
+            or "text_embeds" not in added_cond_kwargs
+            or "time_ids" not in added_cond_kwargs
+        ):
+            raise RuntimeError(
+                "TRTControlNetSDXLAdapter requires added_cond_kwargs "
+                "with 'text_embeds' and 'time_ids'."
+            )
+
+        down, mid = self.engine(
+            sample=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=controlnet_cond,
+            controlnet_scale=scale,
+            text_embeds=added_cond_kwargs["text_embeds"],
+            time_ids=added_cond_kwargs["time_ids"],
+        )
+        if return_dict:
+            from diffusers.models.controlnets.controlnet import ControlNetOutput
+            return ControlNetOutput(down_block_res_samples=down, mid_block_res_sample=mid)
+        return (down, mid)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+
 class TRTUNetAdapter:
     """Thin wrapper for the vendored UNet engine.
 

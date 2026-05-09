@@ -267,6 +267,180 @@ class ControlNetEngine:
         pass
 
 
+class UNet2DConditionModelSDXLWithControlEngine:
+    """SDXL UNet engine variant that accepts ControlNet residuals as runtime inputs.
+
+    Inputs match :class:`UNetSDXLWithControlInputs` —
+      sample, timestep, encoder_hidden_states (B,77,2048),
+      text_embeds (B,1280), time_ids (B,6),
+      input_control_00..N-1, input_control_middle.
+    Output: latent.
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        stream: cuda.Stream,
+        num_down_residuals: int,
+        use_cuda_graph: bool = False,
+    ):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.use_cuda_graph = use_cuda_graph
+        self.num_down_residuals = num_down_residuals
+        self.engine.load()
+        self.engine.activate()
+
+    def __call__(
+        self,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        text_embeds: torch.Tensor,
+        time_ids: torch.Tensor,
+        down_block_residuals,  # list[Tensor] of length num_down_residuals
+        mid_block_residual: torch.Tensor,
+        **kwargs,
+    ) -> Any:
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+
+        shape_dict = {
+            "sample": latent_model_input.shape,
+            "timestep": timestep.shape,
+            "encoder_hidden_states": encoder_hidden_states.shape,
+            "text_embeds": text_embeds.shape,
+            "time_ids": time_ids.shape,
+            "latent": latent_model_input.shape,
+            "input_control_middle": mid_block_residual.shape,
+        }
+        feed = {
+            "sample": latent_model_input,
+            "timestep": timestep,
+            "encoder_hidden_states": encoder_hidden_states,
+            "text_embeds": text_embeds,
+            "time_ids": time_ids,
+            "input_control_middle": mid_block_residual,
+        }
+        for i in range(self.num_down_residuals):
+            shape_dict[f"input_control_{i:02d}"] = down_block_residuals[i].shape
+            feed[f"input_control_{i:02d}"] = down_block_residuals[i]
+
+        self.engine.allocate_buffers(
+            shape_dict=shape_dict, device=latent_model_input.device,
+        )
+        noise_pred = self.engine.infer(
+            feed, self.stream, use_cuda_graph=self.use_cuda_graph,
+        )["latent"]
+        return UNet2DConditionOutput(sample=noise_pred)
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
+class ControlNetSDXLEngine:
+    """Runtime wrapper for a standalone SDXL ControlNet TRT engine.
+
+    Mirrors :class:`ControlNetEngine` but threads SDXL aug-conditioning
+    (``text_embeds`` + ``time_ids``) through the engine and returns the
+    SDXL residual layout: 9 down samples + 1 mid (vs. 12+1 for SD1.5).
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        stream: cuda.Stream,
+        num_down_residuals: int = 9,
+        block_out_channels: Tuple[int, ...] = (320, 640, 1280),
+        use_cuda_graph: bool = False,
+    ):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.use_cuda_graph = use_cuda_graph
+        self.num_down_residuals = num_down_residuals
+        self.block_out_channels = tuple(block_out_channels)
+        self.engine.load()
+        self.engine.activate()
+
+    def _residual_spec(self) -> List[Tuple[int, int]]:
+        chans = self.block_out_channels
+        if len(chans) == 3 and self.num_down_residuals == 9:
+            return [
+                (chans[0], 1), (chans[0], 1), (chans[0], 1),
+                (chans[0], 2), (chans[1], 2), (chans[1], 2),
+                (chans[1], 4), (chans[2], 4), (chans[2], 4),
+            ]
+        return [(chans[0], 1)] * self.num_down_residuals
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
+        controlnet_scale: torch.Tensor,
+        text_embeds: torch.Tensor,
+        time_ids: torch.Tensor,
+        **kwargs,
+    ) -> Any:
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor(timestep, device=sample.device)
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+        if controlnet_scale.dtype != torch.float32:
+            controlnet_scale = controlnet_scale.float()
+        if controlnet_cond.dtype != torch.float32:
+            controlnet_cond = controlnet_cond.float()
+
+        B, _, lH, lW = sample.shape
+        chans = self.block_out_channels
+        spec = self._residual_spec()
+        # SDXL mid lives at /4 of latent (matches the spec's deepest stride).
+        shape_dict: Dict[str, tuple] = {
+            "sample": sample.shape,
+            "timestep": timestep.shape,
+            "encoder_hidden_states": encoder_hidden_states.shape,
+            "controlnet_cond": controlnet_cond.shape,
+            "controlnet_scale": controlnet_scale.shape,
+            "text_embeds": text_embeds.shape,
+            "time_ids": time_ids.shape,
+            "mid_block_res_sample": (B, chans[-1], max(1, lH // 4), max(1, lW // 4)),
+        }
+        for i, (c, ds) in enumerate(spec):
+            shape_dict[f"down_block_res_sample_{i}"] = (
+                B, c, max(1, lH // ds), max(1, lW // ds),
+            )
+
+        self.engine.allocate_buffers(shape_dict=shape_dict, device=sample.device)
+        out = self.engine.infer(
+            {
+                "sample": sample,
+                "timestep": timestep,
+                "encoder_hidden_states": encoder_hidden_states,
+                "controlnet_cond": controlnet_cond,
+                "controlnet_scale": controlnet_scale,
+                "text_embeds": text_embeds,
+                "time_ids": time_ids,
+            },
+            self.stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        down_residuals = [
+            out[f"down_block_res_sample_{i}"] for i in range(self.num_down_residuals)
+        ]
+        mid_residual = out["mid_block_res_sample"]
+        return down_residuals, mid_residual
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
 class AutoencoderKLEngine:
     def __init__(
         self,

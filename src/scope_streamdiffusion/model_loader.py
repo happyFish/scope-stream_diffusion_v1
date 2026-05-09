@@ -412,6 +412,10 @@ class ModelLoader:
         p.sdxl = type(p.pipe) is StableDiffusionXLPipeline
         if p.sdxl and self.dtype == torch.float16:
             self.install_sdxl_fp16_vae()
+        # Re-route ControlNet handler to the SDXL- or SD1.5-keyed weights for
+        # the new host. ``release_pipe_state`` cleared the cache, so the next
+        # ``update()`` will load the right repo from scratch.
+        p._cn.set_sdxl(p.sdxl)
 
         p.text_encoder = p.pipe.text_encoder
         p.unet = p.pipe.unet

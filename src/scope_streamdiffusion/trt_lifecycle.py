@@ -404,7 +404,9 @@ class TRTLifecycle:
 
         from .trt_engines import (
             TRTControlNetAdapter,
+            TRTControlNetSDXLAdapter,
             build_controlnet_engine,
+            build_controlnet_sdxl_engine,
             make_cuda_stream,
         )
 
@@ -424,19 +426,38 @@ class TRTLifecycle:
             flush=True,
         )
         try:
-            engine_path = build_controlnet_engine(
-                self.pipe._cn.model,
-                model_id=self.pipe.model_id,
-                controlnet_id=mode,
-                image_height=int(self.pipe.height),
-                image_width=int(self.pipe.width),
-                min_batch_size=1,
-                max_batch_size=4,
-            )
+            if self.sdxl:
+                engine_path = build_controlnet_sdxl_engine(
+                    self.pipe._cn.model,
+                    model_id=self.pipe.model_id,
+                    controlnet_id=mode,
+                    image_height=int(self.pipe.height),
+                    image_width=int(self.pipe.width),
+                    min_batch_size=1,
+                    max_batch_size=1,
+                )
+            else:
+                engine_path = build_controlnet_engine(
+                    self.pipe._cn.model,
+                    model_id=self.pipe.model_id,
+                    controlnet_id=mode,
+                    image_height=int(self.pipe.height),
+                    image_width=int(self.pipe.width),
+                    min_batch_size=1,
+                    max_batch_size=4,
+                )
         except Exception as e:
             print(f"[TRT] ControlNet engine build failed for {mode}, using eager: {e}")
             return
-        adapter = TRTControlNetAdapter(engine_path, self._trt_cuda_stream)
+        if self.sdxl:
+            bocs = tuple(self.pipe._cn.model.config.block_out_channels)
+            adapter = TRTControlNetSDXLAdapter(
+                engine_path, self._trt_cuda_stream,
+                num_down_residuals=9,
+                block_out_channels=bocs,
+            )
+        else:
+            adapter = TRTControlNetAdapter(engine_path, self._trt_cuda_stream)
         self._trt_eager_controlnets[mode] = self.pipe._cn.model
         self._trt_cn_engines[mode] = adapter
         self.pipe.controlnet = adapter
@@ -524,9 +545,11 @@ class TRTLifecycle:
         from .trt_engines import (
             TRTUNetAdapter,
             TRTUNetSDXLAdapter,
+            TRTUNetSDXLWithControlAdapter,
             TRTUNetWithControlAdapter,
             build_unet_engine,
             build_unet_sdxl_engine,
+            build_unet_sdxl_with_control_engine,
             build_unet_with_control_engine,
             make_cuda_stream,
         )
@@ -537,16 +560,56 @@ class TRTLifecycle:
 
         if want_control:
             if self.sdxl:
-                # SDXL + ControlNet + TRT: not yet wired. The ControlNet
-                # path uses UNetWithControlInputs which assumes SD1.5
-                # signature (no text_embeds/time_ids). Falling through to
-                # eager keeps SDXL+ControlNet working until that variant
-                # gets the same SDXL aug-conditioning treatment as
-                # build_unet_sdxl_engine.
-                raise NotImplementedError(
-                    "SDXL + ControlNet + TRT not yet supported. Use "
-                    "acceleration_mode='none' with controlnet on SDXL models."
+                # SDXL+ControlNet path: combined-engine variant that bakes
+                # both the SDXL aug-conditioning and the ControlNet residual
+                # input slots into the UNet engine. Same VAE/text-encoder
+                # offload trick as the plain SDXL UNet build to keep the
+                # 24 GB workspace ceiling honored.
+                cn_id = controlnet_mode  # depth/scribble — keyed in cache via mode label
+                print(
+                    "[TRT] Preparing SDXL UNet+ctrl engine — first build takes 5-15 min, cached after",
+                    flush=True,
                 )
+                print("[TRT] Moving VAE + text encoders to CPU during build", flush=True)
+                cpu_components = []
+                for attr in ("vae", "text_encoder", "text_encoder_2"):
+                    comp = getattr(self.pipe.pipe, attr, None)
+                    if comp is not None and hasattr(comp, "to"):
+                        try:
+                            comp.to("cpu")
+                            cpu_components.append((attr, comp))
+                        except Exception as e:
+                            print(f"[TRT] could not move {attr} to CPU: {e}", flush=True)
+                torch.cuda.empty_cache()
+                # Pull block_out_channels from the live UNet config so the
+                # engine I/O spec matches whatever SDXL variant is loaded.
+                bocs = tuple(self.pipe.pipe.unet.config.block_out_channels)
+                num_down = 9
+                engine_path = build_unet_sdxl_with_control_engine(
+                    self.pipe.pipe.unet,
+                    model_id=self.pipe.model_id,
+                    controlnet_id=cn_id,
+                    image_height=eff_h,
+                    image_width=eff_w,
+                    min_batch_size=1,
+                    max_batch_size=1,
+                    num_down_residuals=num_down,
+                    block_out_channels=bocs,
+                )
+                print("[TRT] Restoring VAE + text encoders to GPU", flush=True)
+                for attr, comp in cpu_components:
+                    try:
+                        comp.to(self.device)
+                    except Exception as e:
+                        print(f"[TRT] could not restore {attr} to {self.device}: {e}", flush=True)
+                self._trt_eager_unet = self.pipe.pipe.unet
+                self.pipe.unet = TRTUNetSDXLWithControlAdapter(
+                    engine_path, self._trt_cuda_stream, num_down_residuals=num_down,
+                )
+                cache_state.unet_adapter = self.pipe.unet
+                cache_state.unet_has_controlnet = True
+                print(f"[TRT] SDXL UNet+ctrl engine active: {engine_path}", flush=True)
+                return
             print(
                 "[TRT] Preparing UNet+ctrl engine — first build takes 5-10 min, cached after",
                 flush=True,

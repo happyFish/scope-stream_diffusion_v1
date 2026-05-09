@@ -332,19 +332,27 @@ class InferenceCore:
             x_t_latent_plus_uc = x_t_latent
 
         # Compute ControlNet residuals if conditioning is available. Same
-        # signature for eager and TRT ControlNet adapters.
+        # signature for eager and TRT ControlNet adapters. SDXL ControlNet
+        # also needs added_cond_kwargs (text_embeds + time_ids) — without
+        # them the residuals are computed against zero aug-conditioning and
+        # the conditioning misaligns with the UNet pass.
         down_block_res_samples = None
         mid_block_res_sample = None
         if p.controlnet is not None and p.controlnet_input is not None:
             batch_size = x_t_latent_plus_uc.shape[0]
             cond_image = p.controlnet_input.expand(batch_size, -1, -1, -1)
-            down_block_res_samples, mid_block_res_sample = p.controlnet(
-                x_t_latent_plus_uc,
-                t_list,
+            cn_kwargs = dict(
                 encoder_hidden_states=p.prompts.prompt_embeds,
                 controlnet_cond=cond_image,
                 conditioning_scale=p.controlnet_conditioning_scale,
                 return_dict=False,
+            )
+            if p.sdxl and added_cond_kwargs:
+                cn_kwargs["added_cond_kwargs"] = added_cond_kwargs
+            down_block_res_samples, mid_block_res_sample = p.controlnet(
+                x_t_latent_plus_uc,
+                t_list,
+                **cn_kwargs,
             )
 
         model_pred = p.unet(
