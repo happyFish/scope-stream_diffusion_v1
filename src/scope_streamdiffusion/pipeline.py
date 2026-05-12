@@ -14,6 +14,7 @@ from scope.core.pipelines.interface import Pipeline, Requirements
 
 from .controlnet import ControlNetHandler
 from .inference_core import InferenceCore
+from .mask_compositor import composite as mask_composite
 from .model_loader import MODEL_PRESETS, ModelLoader
 from .prompt_encoder import PromptEncoder, normalize_prompts
 from .schema import StreamDiffusionConfig
@@ -194,7 +195,13 @@ class StreamDiffusionPipeline(Pipeline):
 
         print("StreamDiffusion pipeline initialized (model load deferred)")
 
-    def _ensure_pipe_loaded(self, model_id: str) -> None:
+    def _ensure_pipe_loaded(
+        self,
+        model_id: str,
+        *,
+        loras: Optional[list] = None,
+        lora_strategy: Optional[str] = None,
+    ) -> None:
         """Load the diffusion model and populate model-dependent state.
 
         Called once from the first ``__call__`` with the user's actual
@@ -215,7 +222,17 @@ class StreamDiffusionPipeline(Pipeline):
         preset = MODEL_PRESETS.get(model_id, {})
         self._timesteps_override = preset.get("timesteps_override")
         self._implicit_loopback = preset.get("implicit_loopback", True)
-        self.pipe = self.model_loader.load(model_id)
+        # Skip the CPU→GPU staging for components destined for CPU offload
+        # right after engine setup. Saves a few hundred ms of PCIe traffic
+        # per cold load when TRT / TAESD are active.
+        trt_path = self.trt.acceleration_mode == "trt"
+        cfg = getattr(self, "config", None)
+        use_taesd = bool(getattr(cfg, "use_taesd", True)) if cfg else True
+        self.pipe = self.model_loader.load(
+            model_id,
+            keep_unet_on_cpu=trt_path,
+            keep_full_vae_on_cpu=trt_path and use_taesd,
+        )
         print(f"[StreamDiffusion] Model loaded: {self.pipe.__class__.__name__}")
 
         self.sdxl = type(self.pipe) is StableDiffusionXLPipeline
@@ -224,6 +241,20 @@ class StreamDiffusionPipeline(Pipeline):
         # ControlNet handler routes to SDXL-specific weights when the host
         # pipeline is SDXL (depth/scribble names map to different repos).
         self._cn.set_sdxl(self.sdxl)
+
+        # Attach LoRAs (if any) before TRT setup so engine builds see the
+        # post-LoRA weights. Caller-supplied overrides win over
+        # ``self.config`` so a first-frame load that was triggered with
+        # the user's live picker selection compiles against that stack.
+        if loras is None:
+            cfg = getattr(self, "config", None)
+            loras = list(getattr(cfg, "loras", None) or [])
+        if lora_strategy is None:
+            cfg = getattr(self, "config", None)
+            lora_strategy = (
+                getattr(cfg, "lora_merge_strategy", None) or "runtime_peft"
+            )
+        self.model_loader.apply_loras(loras, lora_strategy)
 
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
@@ -239,9 +270,54 @@ class StreamDiffusionPipeline(Pipeline):
         if self.trt.acceleration_mode == "trt":
             self.trt.setup(**self.trt.setup_args_from_config())
 
-    def _swap_model(self, new_model_id: str) -> None:
-        """Thin entry point. Mechanics live in :meth:`ModelLoader.swap`."""
-        self.model_loader.swap(new_model_id)
+    def _swap_model(
+        self,
+        new_model_id: str,
+        *,
+        loras: Optional[list] = None,
+        lora_strategy: Optional[str] = None,
+        setup_kwargs: Optional[dict] = None,
+    ) -> None:
+        """Thin entry point. Mechanics live in :meth:`ModelLoader.swap`.
+
+        ``setup_kwargs`` overrides ``trt.setup_args_from_config()`` for the
+        post-swap engine build — without it the build uses ``self.config``,
+        which is the load-time snapshot and may be stale relative to the
+        current scene (mid-stream model swaps with concurrent CN-mode or
+        resolution changes would otherwise build against the wrong sig and
+        then immediately rebuild on the next frame).
+        """
+        self.model_loader.swap(
+            new_model_id, loras=loras, lora_strategy=lora_strategy,
+            setup_kwargs=setup_kwargs,
+        )
+
+    def _rebuild_unet_for_lora_change(
+        self, loras: list, strategy: str,
+        *, setup_kwargs: Optional[dict] = None,
+    ) -> None:
+        """Surgical TRT rebuild for a LoRA-only change — UNet engine only.
+
+        The text encoder, full VAE, TAESD, and ControlNet weights aren't
+        touched by UNet-only LoRAs, so a full ``ModelLoader.swap`` (which
+        re-downloads/re-loads every component) is wasteful. Apply the new
+        LoRA stack to the always-eager ``pipe.pipe.unet``, reset TRT's
+        sticky UNet build flags, and let ``trt.setup`` rebuild the UNet
+        engine against the new weights. The TRT cache key already includes
+        the LoRA signature, so disk-cached engines for prior signatures
+        still hit instantly when re-selected.
+
+        ``setup_kwargs`` lets the caller pass the live runtime sig
+        (h, w, controlnet_mode, use_taesd) instead of falling back to
+        the load-time config snapshot.
+        """
+        self.model_loader.apply_loras(loras, strategy)
+        self.trt._trt_unet_built = False
+        self.trt._trt_unet_has_controlnet = False
+        self.trt._trt_eager_unet = None
+        self.trt._trt_setup_signature = None
+        self.trt.setup(**(setup_kwargs or self.trt.setup_args_from_config()))
+        self.unet = self.pipe.unet
 
     def prepare(self, **kwargs) -> "Requirements | None":
         """Specify pipeline requirements based on current mode.
@@ -437,17 +513,136 @@ class StreamDiffusionPipeline(Pipeline):
             # Finally use default
             return default
 
+        # Resolve the TRT setup quad (h, w, controlnet_mode, use_taesd) from
+        # the live runtime kwargs / config now, so we can thread it through
+        # ``_swap_model`` and ``_rebuild_unet_for_lora_change``. Both used to
+        # call ``trt.setup_args_from_config()`` directly, which read the
+        # load-time ``self.config`` snapshot — stale if the scene changed
+        # CN mode / resolution since load. Pre-resolving once here also
+        # ensures the per-frame setup sig (line 700) and any rebuild use
+        # the same source of truth.
+        runtime_setup_kwargs = {
+            "height": int(get_param("height", 512)),
+            "width": int(get_param("width", 512)),
+            "controlnet_mode": get_param("controlnet_mode", "none") or "none",
+            "use_taesd": bool(get_param("use_taesd", True)),
+        }
+
         # Resolve the user's model selection from runtime kwargs/config.
         # On the first call the pipe isn't loaded yet — __init__ defers the
         # load specifically so we can pick the *real* selection here instead
         # of the schema default that pipeline_manager hands us at __init__.
         # On subsequent calls a runtime change (UI swap) routes through
         # _swap_model.
+        # Resolve the live LoRA stack from runtime kwargs/config — used
+        # both for first-load and for runtime change detection. Picker
+        # output arrives as raw dicts in runtime kwargs and as LoraSpec
+        # instances on the config; ``ModelLoader.apply_loras`` handles both.
+        #
+        # Two runtime kwarg shapes coexist:
+        #   * ``loras`` — Scope-native key, full picker payload
+        #     ([{path, scale, id?, mergeMode?}, ...]).
+        #   * ``lora_scales`` — moth's scene-engine key, slimmer
+        #     ([{path, scale}, ...]). When only this arrives, treat it
+        #     as the full stack so live scale changes from moth's
+        #     timeline take effect.
+        # When both are present, ``lora_scales`` overrides scales on
+        # matching paths in ``loras`` (and adds any new entries).
+        from .model_loader import lora_signature_from_specs
+        raw_loras = get_param("loras", []) or []
+        # Hosts without an array control (e.g. moth's current params panel)
+        # surface ``loras`` as a free-form text input. Accept the JSON-string
+        # shape at runtime too — schema coercion only fires at config init.
+        if isinstance(raw_loras, str):
+            import json
+            try:
+                raw_loras = json.loads(raw_loras) if raw_loras.strip() else []
+            except json.JSONDecodeError:
+                print(f"[StreamDiffusion] loras runtime kwarg not valid JSON, ignoring: {raw_loras!r}")
+                raw_loras = []
+        new_loras = list(raw_loras)
+        runtime_scales = list(kwargs.get("lora_scales") or [])
+        if runtime_scales:
+            def _path(s): return s.get("path") if isinstance(s, dict) else getattr(s, "path", None)
+            def _scale(s): return s.get("scale") if isinstance(s, dict) else getattr(s, "scale", 1.0)
+            scale_by_path = {_path(s): _scale(s) for s in runtime_scales if _path(s)}
+            if not new_loras:
+                new_loras = [{"path": p, "scale": s} for p, s in scale_by_path.items()]
+            else:
+                merged = []
+                seen_paths = set()
+                for spec in new_loras:
+                    p = _path(spec)
+                    if p in scale_by_path:
+                        merged.append({"path": p, "scale": scale_by_path[p]})
+                    else:
+                        merged.append(spec)
+                    seen_paths.add(p)
+                for p, s in scale_by_path.items():
+                    if p not in seen_paths:
+                        merged.append({"path": p, "scale": s})
+                new_loras = merged
+        new_strategy = get_param("lora_merge_strategy", "runtime_peft") or "runtime_peft"
+
         requested_model = get_param("model_id_or_path", None) or self.model_id
         if self.pipe is None:
-            self._ensure_pipe_loaded(requested_model)
+            self._ensure_pipe_loaded(
+                requested_model, loras=new_loras, lora_strategy=new_strategy,
+            )
         elif requested_model and requested_model != self.model_id:
-            self._swap_model(requested_model)
+            self._swap_model(
+                requested_model, loras=new_loras, lora_strategy=new_strategy,
+                setup_kwargs=runtime_setup_kwargs,
+            )
+
+        # Runtime LoRA change detection. Phase 1 strategy:
+        #   * eager — call ``apply_loras`` (cheap fast paths handle scale-only).
+        #   * TRT — engine bakes weights at compile time, so any change other
+        #     than first-attach forces a full reload + recompile via the
+        #     swap path. Surface the cost; the user opted into TRT.
+        new_lora_sig = lora_signature_from_specs(new_loras)
+        cur_lora_sig = self.model_loader._lora_signature
+        cur_lora_strategy = self.model_loader._lora_strategy
+        lora_changed = (
+            cur_lora_sig is not None
+            and (new_lora_sig != cur_lora_sig or new_strategy != cur_lora_strategy)
+        )
+        if lora_changed:
+            if self.trt.acceleration_mode == "trt":
+                # Fast path: paths unchanged, only scales moved. Apply
+                # new scales to eager UNet, then refit the live engine
+                # in place. ~hundreds of ms vs ~5-15 min rebuild. Engine
+                # must have been built with refit enabled — true by
+                # default when any LoRA is present (see lora_refit.py).
+                from .lora_refit import is_scale_only_change
+                cur_paths = self.model_loader._lora_paths
+                new_paths = tuple(p for p, _ in new_lora_sig)
+                if (
+                    new_strategy == cur_lora_strategy
+                    and is_scale_only_change(cur_paths, cur_lora_sig, new_paths, new_lora_sig)
+                ):
+                    self.model_loader.apply_loras(new_loras, new_strategy)
+                    if self.trt.try_refit_unet_lora_scales():
+                        print(
+                            "[StreamDiffusion] LoRA scales hot-refitted under TRT "
+                            "(no engine rebuild)"
+                        )
+                    else:
+                        print(
+                            "[StreamDiffusion] hot-refit unavailable — "
+                            "falling back to UNet engine rebuild"
+                        )
+                        self._rebuild_unet_for_lora_change(
+                            new_loras, new_strategy, setup_kwargs=runtime_setup_kwargs,
+                        )
+                else:
+                    print(
+                        "[StreamDiffusion] LoRA stack changed under TRT — "
+                        "rebuilding UNet engine (text encoder / VAE / ControlNet untouched)"
+                    )
+                    self._rebuild_unet_for_lora_change(new_loras, new_strategy)
+            else:
+                self.model_loader.apply_loras(new_loras, new_strategy)
 
         # Extract all parameters with config fallback
         prompt_interpolation_method = get_param("prompt_interpolation_method", "linear")
@@ -528,7 +723,13 @@ class StreamDiffusionPipeline(Pipeline):
             depth_input_size=depth_input_size,
             depth_temporal_cache=depth_temporal_cache,
         )
-        self.controlnet = self._cn.model
+        # In TRT mode the trt lifecycle binds ``self.controlnet`` to the TRT
+        # adapter via ``_ensure_controlnet`` at setup time. Overwriting it
+        # here with the eager weights would defeat that — and since the
+        # eager CN is now CPU-offloaded after the engine activates, the
+        # overwrite would also crash inference with a device-mismatch.
+        if acceleration_mode != "trt":
+            self.controlnet = self._cn.model
         self.controlnet_input = self._cn.input
 
         # TRT engines are normally built at load time (in __init__ /
@@ -644,32 +845,21 @@ class StreamDiffusionPipeline(Pipeline):
         # Convert back to Scope format: (B, C, H, W) -> (T, H, W, C)
         output = x_output.permute(0, 2, 3, 1)
 
-        # ── Mask compositing ──────────────────────────────────────────
-        # Drop-in compatible with vace_input_masks from yolo_mask / scope-sam3
-        # (shape (1, 1, F, H, W), binary). SD output where mask=1, original
-        # where mask=0; flip via the upstream segmenter's Invert Mask. Skip
-        # in pure text mode where there's no original frame to blend with.
-        mask_compositing = bool(kwargs.get("mask_compositing", False))
-        mask_strength = float(kwargs.get("mask_strength", 1.0))
-        masks_in = kwargs.get("vace_input_masks")
-        if (
-            mask_compositing
-            and mask_strength > 0
-            and masks_in is not None
-            and frame is not None
-        ):
-            m = masks_in[:, :, 0].to(device=output.device, dtype=output.dtype)
-            if m.shape[-2:] != (height, width):
-                m = torch.nn.functional.interpolate(
-                    m, size=(height, width), mode="bilinear", align_corners=False
-                )
-            mask_feather = float(kwargs.get("mask_feather", 0.0))
-            if mask_feather > 0:
-                k = max(1, int(mask_feather) * 2 + 1)
-                m = torch.nn.functional.avg_pool2d(m, k, stride=1, padding=k // 2)
-            m = (m * mask_strength).clamp(0, 1).permute(0, 2, 3, 1)  # (1,H,W,1)
-            orig = frame.unsqueeze(0).to(device=output.device, dtype=output.dtype)
-            output = m * output + (1.0 - m) * orig
+        # Mask compositing — blend SD output with the upstream background
+        # source according to a binary mask from a segmenter (yolo_mask,
+        # scope-sam3). Stateless module; see mask_compositor.py for the
+        # shape coercions and the actual math.
+        if kwargs.get("mask_compositing", False):
+            output = mask_composite(
+                sd_output=output,
+                height=height,
+                width=width,
+                masks_in=kwargs.get("vace_input_masks"),
+                vace_frames=kwargs.get("vace_input_frames"),
+                fallback_frame=frame,
+                mask_strength=float(kwargs.get("mask_strength", 1.0)),
+                mask_feather=float(kwargs.get("mask_feather", 0.0)),
+            )
 
         # Cache result
         self.prev_image_result = output

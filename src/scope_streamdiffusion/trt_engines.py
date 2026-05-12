@@ -54,6 +54,28 @@ def _model_cache_dir(model_id: str, suffix: str = "") -> Path:
     return d
 
 
+def _lora_cache_tag(lora_signature: tuple | None, *, paths_only: bool = False) -> str:
+    """Short tag derived from the LoRA stack for engine cache keying.
+
+    Empty stack → empty tag (engines compiled without LoRAs share a cache
+    slot with the no-LoRA case). Non-empty → 8-char sha of the sorted
+    ``((path, scale), ...)`` representation.
+
+    ``paths_only=True`` hashes only the LoRA paths, ignoring scales —
+    used when the engine is built with refit enabled so a single engine
+    serves any scale (scale changes are applied at runtime via the
+    ``IRefitter`` path in ``lora_refit.py``). Without this every scale
+    tweak would produce a fresh 5 GB engine on disk.
+    """
+    if not lora_signature:
+        return ""
+    if paths_only:
+        sig_str = ",".join(p for p, _ in lora_signature)
+    else:
+        sig_str = ",".join(f"{p}@{float(s):.6f}" for p, s in lora_signature)
+    return hashlib.sha256(sig_str.encode()).hexdigest()[:8]
+
+
 def build_controlnet_engine(
     controlnet,
     *,
@@ -195,6 +217,7 @@ def build_unet_with_control_engine(
     min_batch_size: int = 1,
     max_batch_size: int = 4,
     num_down_residuals: int = 12,
+    lora_signature: tuple | None = None,
 ) -> Path:
     """Build (or reuse) a TRT UNet engine that accepts ControlNet residuals
     as runtime inputs. Pair with `build_controlnet_engine` to get
@@ -207,7 +230,9 @@ def build_unet_with_control_engine(
     )
 
     suffix = f"unet_ctrl_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
-    cache_dir = _model_cache_dir(model_id, suffix)
+    lora_tag = _lora_cache_tag(lora_signature)
+    cache_id = f"{model_id}::lora={lora_tag}" if lora_tag else model_id
+    cache_dir = _model_cache_dir(cache_id, suffix)
     onnx_dir = cache_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
     engine_path = cache_dir / "unet_ctrl.engine"
@@ -317,7 +342,9 @@ def build_unet_engine(
     image_width: int = 512,
     min_batch_size: int = 1,
     max_batch_size: int = 4,
-) -> Path:
+    lora_signature: tuple | None = None,
+    enable_refit: bool = False,
+) -> tuple[Path, bool]:
     """Build (or reuse) a TRT engine for the given UNet. Returns engine path.
 
     The engine accepts dynamic spatial dims 256-1024 and batch min..max.
@@ -327,14 +354,18 @@ def build_unet_engine(
     from ._trt import UNet, compile_unet, create_onnx_path
 
     suffix = f"unet_b{min_batch_size}-{max_batch_size}_h{image_height}_w{image_width}"
-    cache_dir = _model_cache_dir(model_id, suffix)
+    if enable_refit:
+        suffix += "_refit"
+    lora_tag = _lora_cache_tag(lora_signature, paths_only=enable_refit)
+    cache_id = f"{model_id}::lora={lora_tag}" if lora_tag else model_id
+    cache_dir = _model_cache_dir(cache_id, suffix)
     onnx_dir = cache_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
     engine_path = cache_dir / "unet.engine"
 
     if engine_path.exists():
         logger.info(f"[TRT] Reusing cached UNet engine: {engine_path}")
-        return engine_path
+        return engine_path, False
 
     logger.info(f"[TRT] Building UNet engine -> {engine_path} (5-10 min on first build)")
 
@@ -359,6 +390,7 @@ def build_unet_engine(
         engine_build_options={
             "build_dynamic_shape": True,
             "build_static_batch": False,
+            "build_enable_refit": enable_refit,
         },
     )
     # ONNX intermediates can be GBs and aren't needed once the engine is built.
@@ -366,7 +398,7 @@ def build_unet_engine(
     if onnx_dir.exists():
         shutil.rmtree(onnx_dir, ignore_errors=True)
     logger.info(f"[TRT] UNet engine built: {engine_path}")
-    return engine_path
+    return engine_path, True
 
 
 def build_unet_sdxl_engine(
@@ -379,7 +411,9 @@ def build_unet_sdxl_engine(
     max_batch_size: int = 1,
     min_image_resolution: int = 512,
     max_image_resolution: int = 1024,
-) -> Path:
+    lora_signature: tuple | None = None,
+    enable_refit: bool = False,
+) -> tuple[Path, bool]:
     """Build (or reuse) a TRT engine for an SDXL UNet.
 
     Differs from `build_unet_engine` only in the I/O spec — adds
@@ -406,14 +440,18 @@ def build_unet_sdxl_engine(
         f"h{min_image_resolution}-{max_image_resolution}_"
         f"w{min_image_resolution}-{max_image_resolution}"
     )
-    cache_dir = _model_cache_dir(model_id, suffix)
+    if enable_refit:
+        suffix += "_refit"
+    lora_tag = _lora_cache_tag(lora_signature, paths_only=enable_refit)
+    cache_id = f"{model_id}::lora={lora_tag}" if lora_tag else model_id
+    cache_dir = _model_cache_dir(cache_id, suffix)
     onnx_dir = cache_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
     engine_path = cache_dir / "unet_sdxl.engine"
 
     if engine_path.exists():
         logger.info(f"[TRT] Reusing cached SDXL UNet engine: {engine_path}")
-        return engine_path
+        return engine_path, False
 
     logger.info(f"[TRT] Building SDXL UNet engine -> {engine_path} (5-10 min on first build)")
 
@@ -440,13 +478,14 @@ def build_unet_sdxl_engine(
             # Min/max bounds for the dynamic shape envelope.
             "min_image_resolution": min_image_resolution,
             "max_image_resolution": max_image_resolution,
+            "build_enable_refit": enable_refit,
         },
     )
     import shutil
     if onnx_dir.exists():
         shutil.rmtree(onnx_dir, ignore_errors=True)
     logger.info(f"[TRT] SDXL UNet engine built: {engine_path}")
-    return engine_path
+    return engine_path, True
 
 
 class TRTUNetSDXLAdapter:
@@ -523,6 +562,7 @@ def build_unet_sdxl_with_control_engine(
     max_image_resolution: int = 1024,
     num_down_residuals: int = 9,
     block_out_channels: tuple[int, ...] = (320, 640, 1280),
+    lora_signature: tuple | None = None,
 ) -> Path:
     """Build (or reuse) a TRT engine for SDXL UNet + ControlNet residuals.
 
@@ -547,7 +587,10 @@ def build_unet_sdxl_with_control_engine(
         f"h{min_image_resolution}-{max_image_resolution}_"
         f"w{min_image_resolution}-{max_image_resolution}"
     )
-    cache_dir = _model_cache_dir(f"{model_id}::{controlnet_id}", suffix)
+    lora_tag = _lora_cache_tag(lora_signature)
+    base_id = f"{model_id}::{controlnet_id}"
+    cache_id = f"{base_id}::lora={lora_tag}" if lora_tag else base_id
+    cache_dir = _model_cache_dir(cache_id, suffix)
     onnx_dir = cache_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
     engine_path = cache_dir / "unet_sdxl_ctrl.engine"

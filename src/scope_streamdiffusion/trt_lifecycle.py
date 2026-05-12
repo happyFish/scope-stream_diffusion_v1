@@ -206,12 +206,16 @@ class TRTLifecycle:
         without rebuilding.
         """
         if self._trt_eager_unet is not None and self.pipe.unet is not self._trt_eager_unet:
+            # Eager UNet was offloaded to CPU after engine build; bring it
+            # back before swapping the live pipe.unet to it.
+            self._restore_eager_unet_to_gpu()
             self.pipe.unet = self._trt_eager_unet
         if self._trt_eager_taesd is not None:
             self.pipe._taesd_vae = self._trt_eager_taesd
             if self.pipe._using_taesd:
                 self.pipe.vae = self.pipe._taesd_vae
         if self.pipe._cn.model is not None:
+            self._restore_eager_controlnet_to_gpu()
             self.pipe.controlnet = self.pipe._cn.model
         self._trt_unet_built = False
         self._trt_unet_has_controlnet = False
@@ -252,6 +256,9 @@ class TRTLifecycle:
             import traceback
             traceback.print_exc()
             if self._trt_eager_unet is not None:
+                # Eager UNet may be CPU-resident (post-build VRAM saver).
+                # Bring it back before pointing pipe.unet at it.
+                self._restore_eager_unet_to_gpu()
                 self.pipe.unet = self._trt_eager_unet
         if controlnet_mode in ("depth", "scribble"):
             try:
@@ -381,6 +388,7 @@ class TRTLifecycle:
             if adapter is not None and self.pipe.controlnet is not adapter:
                 self._trt_eager_controlnets[mode] = self.pipe._cn.model
                 self.pipe.controlnet = adapter
+                self._offload_eager_controlnet_to_cpu()
             return
 
         signature = (self.pipe.model_id, int(self.pipe.height), int(self.pipe.width))
@@ -398,6 +406,7 @@ class TRTLifecycle:
                 f"(mode={mode}, key={self._trt_cache_key})",
                 flush=True,
             )
+            self._offload_eager_controlnet_to_cpu()
             return
 
         self._trt_cn_built_modes.add(mode)  # mark before build to prevent retry storm
@@ -463,6 +472,7 @@ class TRTLifecycle:
         self.pipe.controlnet = adapter
         cache_state.cn_adapters[mode] = adapter
         print(f"[TRT] ControlNet engine active ({mode}): {engine_path}", flush=True)
+        self._offload_eager_controlnet_to_cpu()
 
     def _ensure_unet(
         self,
@@ -502,7 +512,17 @@ class TRTLifecycle:
 
         eff_h = int(image_height if image_height is not None else self.pipe.height)
         eff_w = int(image_width if image_width is not None else self.pipe.width)
-        signature = (self.pipe.model_id, eff_h, eff_w)
+        # LoRA signature is part of the engine identity — different stacks
+        # need different on-disk engines. Read off the model_loader so the
+        # value reflects whatever ``apply_loras`` actually attached.
+        lora_sig = getattr(self.pipe.model_loader, "_lora_signature", None) or ()
+        # When refit is enabled, scale is decoupled from the cache key:
+        # one engine serves any scale, the live engine is refitted on
+        # the fly via lora_refit.refit_unet_lora_scales. Use a
+        # paths-only key here so scale changes don't bust the cache.
+        refit_on = self._should_enable_refit(lora_sig, want_control=want_control)
+        lora_key: tuple = tuple(p for p, _ in lora_sig) if refit_on else lora_sig
+        signature = (self.pipe.model_id, eff_h, eff_w, lora_key)
         cache_state, restored = _trt_cache.get_or_create(self._trt_cache_key, signature)
         if self._trt_cuda_stream is None and cache_state.cuda_stream is not None:
             self._trt_cuda_stream = cache_state.cuda_stream
@@ -515,11 +535,25 @@ class TRTLifecycle:
             self.pipe.unet = cache_state.unet_adapter
             self._trt_unet_built = True
             self._trt_unet_has_controlnet = want_control
+            # Refit context (if any) was attached at build time; rebind
+            # the live diffusers references so post-swap state goes to
+            # the right modules. ``get_strategy`` already closes over the
+            # plugin instance so it sees the current ``_lora_strategy``.
+            existing_ctx = getattr(self.pipe.unet, "_refit_ctx", None)
+            if existing_ctx is not None:
+                existing_ctx.eager_unet = self.pipe.pipe.unet
+                existing_ctx.diffusers_pipe = self.pipe.pipe
             print(
                 f"[TRT] UNet adapter restored from cache "
                 f"(want_control={want_control}, key={self._trt_cache_key})",
                 flush=True,
             )
+            # Restored engine may have been built / last-refitted at a
+            # different scale than the current eager UNet. Sync now so
+            # the first frame already reflects the live scales.
+            if refit_on:
+                self._sync_refit_to_eager()
+            self._offload_eager_unet_to_cpu()
             return
 
         # Set sticky flags before the build so failures don't retry every frame.
@@ -595,6 +629,7 @@ class TRTLifecycle:
                     max_batch_size=1,
                     num_down_residuals=num_down,
                     block_out_channels=bocs,
+                    lora_signature=lora_sig,
                 )
                 print("[TRT] Restoring VAE + text encoders to GPU", flush=True)
                 for attr, comp in cpu_components:
@@ -622,6 +657,7 @@ class TRTLifecycle:
                 min_batch_size=1,
                 max_batch_size=4,
                 num_down_residuals=12,
+                lora_signature=lora_sig,
             )
             self._trt_eager_unet = self.pipe.pipe.unet
             self.pipe.unet = TRTUNetWithControlAdapter(
@@ -632,7 +668,8 @@ class TRTLifecycle:
             print(f"[TRT] UNet+ctrl engine active: {engine_path}", flush=True)
         elif self.sdxl:
             print(
-                "[TRT] Preparing SDXL UNet engine — first build takes 5-10 min, cached after",
+                "[TRT] Preparing SDXL UNet engine — first build takes 5-10 min, cached after"
+                + (" (refittable)" if refit_on else ""),
                 flush=True,
             )
             # TRT's builder TACTIC_DRAM allocator can race our resident
@@ -655,13 +692,15 @@ class TRTLifecycle:
             # TRT's tactic search bounded enough to fit on a 24 GB card.
             # Engine is only valid at the (height, width, batch=1) profile
             # it was built for; resolution changes will trigger a rebuild.
-            engine_path = build_unet_sdxl_engine(
+            engine_path, was_built = build_unet_sdxl_engine(
                 self.pipe.pipe.unet,
                 model_id=self.pipe.model_id,
                 image_height=eff_h,
                 image_width=eff_w,
                 min_batch_size=1,
                 max_batch_size=1,
+                lora_signature=lora_sig,
+                enable_refit=refit_on,
             )
             print("[TRT] Restoring VAE + text encoders to GPU", flush=True)
             for attr, comp in cpu_components:
@@ -671,24 +710,232 @@ class TRTLifecycle:
                     print(f"[TRT] could not restore {attr} to {self.device}: {e}", flush=True)
             self._trt_eager_unet = self.pipe.pipe.unet
             self.pipe.unet = TRTUNetSDXLAdapter(engine_path, self._trt_cuda_stream)
+            self._attach_refit_context(self.pipe.unet, enabled=refit_on)
             cache_state.unet_adapter = self.pipe.unet
             cache_state.unet_has_controlnet = False
             print(f"[TRT] SDXL UNet engine active: {engine_path}", flush=True)
+            # Fresh build's weights match the eager UNet by construction —
+            # ONNX export captured them. Only sync when restoring from
+            # disk, where the file may have been built at a different
+            # scale than the live eager state.
+            if refit_on and not was_built:
+                self._sync_refit_to_eager()
+            self._offload_eager_unet_to_cpu()
         else:
             print(
-                "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after",
+                "[TRT] Preparing UNet engine — first build takes 5-10 min, cached after"
+                + (" (refittable)" if refit_on else ""),
                 flush=True,
             )
-            engine_path = build_unet_engine(
+            engine_path, was_built = build_unet_engine(
                 self.pipe.pipe.unet,
                 model_id=self.pipe.model_id,
                 image_height=eff_h,
                 image_width=eff_w,
                 min_batch_size=1,
                 max_batch_size=4,
+                lora_signature=lora_sig,
+                enable_refit=refit_on,
             )
             self._trt_eager_unet = self.pipe.pipe.unet
             self.pipe.unet = TRTUNetAdapter(engine_path, self._trt_cuda_stream)
+            self._attach_refit_context(self.pipe.unet, enabled=refit_on)
             cache_state.unet_adapter = self.pipe.unet
             cache_state.unet_has_controlnet = False
             print(f"[TRT] UNet engine active: {engine_path}", flush=True)
+            if refit_on and not was_built:
+                self._sync_refit_to_eager()
+            self._offload_eager_unet_to_cpu()
+
+    # ------------------------------------------------------------------
+    # Hot LoRA refit (default-on whenever a LoRA stack is present)
+    # ------------------------------------------------------------------
+
+    def _should_enable_refit(self, lora_sig: tuple, *, want_control: bool = False) -> bool:
+        """True when the engine should be built with refit support.
+
+        Enabled whenever a LoRA stack is present so scale changes can
+        be applied via ``IRefitter`` without rebuilding the engine
+        (and so a single engine on disk serves every scale, rather
+        than one 5 GB engine per scale value).
+
+        Refit costs ~5-8% inference perf and ~10% engine size, but
+        skipping it forces a 5-10 min rebuild on every scale tweak —
+        the trade is one-sided once you have a LoRA.
+
+        Off for ControlNet because the with-control engine builders
+        don't accept the refit flag yet (TODO: thread it through).
+        """
+        return bool(lora_sig) and not want_control
+
+    def _attach_refit_context(self, adapter: Any, *, enabled: bool) -> None:
+        """Stash a RefitContext on the adapter for later refit calls.
+
+        ``adapter.engine.engine`` is the underlying ``Engine`` (from
+        ``_trt/utilities.py``); ``adapter._refit_ctx`` lets the pipeline
+        find it again when scales change.
+        """
+        if not enabled:
+            adapter._refit_ctx = None
+            return
+        try:
+            from .lora_refit import RefitContext
+            inner_engine = getattr(adapter, "engine", None)
+            trt_engine = getattr(inner_engine, "engine", None)
+            pipe_ref = self.pipe  # StreamDiffusionPipeline, has .pipe + .model_loader
+            adapter._refit_ctx = RefitContext(
+                eager_unet=self.pipe.pipe.unet,
+                trt_engine=trt_engine,
+                diffusers_pipe=self.pipe.pipe,
+                # Lambda reads the live strategy each refit — captures the
+                # plugin's model_loader so post-swap strategy changes are seen.
+                get_strategy=lambda p=pipe_ref: getattr(
+                    getattr(p, "model_loader", None), "_lora_strategy", None,
+                ) or "permanent_merge",
+            )
+        except Exception as e:
+            print(f"[LoRA refit] failed to attach refit context: {e}")
+            adapter._refit_ctx = None
+
+    # ------------------------------------------------------------------
+    # Eager UNet CPU offload (memory optimization for tight-VRAM cards)
+    # ------------------------------------------------------------------
+    #
+    # Once the TRT UNet engine is live, the eager UNet (~2.6 GB SDXL fp16)
+    # is no longer used for inference — but we keep a reference for two
+    # things: (a) LoRA refit needs to read its state_dict, (b) the
+    # acceleration_mode='none' toggle needs to restore eager forward.
+    # Both are infrequent operations, so we park the eager UNet on CPU
+    # and round-trip back to GPU only when needed. Frees ~2.6 GB on the
+    # GPU for ControlNet / activations / other allocations.
+
+    def _offload_eager_unet_to_cpu(self) -> None:
+        """Move ``pipe.pipe.unet`` to CPU after the TRT engine is live.
+
+        No-op when the eager UNet is already on CPU or missing. Call after
+        ``_attach_refit_context`` so the refit context's ``eager_unet``
+        reference (same object) just sees the device change.
+        """
+        eager = getattr(self.pipe.pipe, "unet", None)
+        if eager is None:
+            return
+        try:
+            first_param = next(eager.parameters(), None)
+        except StopIteration:
+            first_param = None
+        if first_param is None or first_param.device.type == "cpu":
+            return
+        try:
+            eager.to("cpu")
+            torch.cuda.empty_cache()
+            print(
+                "[TRT] eager UNet offloaded to CPU "
+                "(refit/fallback round-trip on demand)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[TRT] failed to offload eager UNet to CPU: {e}")
+
+    def _restore_eager_unet_to_gpu(self) -> None:
+        """Move ``pipe.pipe.unet`` back to ``self.device``.
+
+        Used by ``deactivate()`` (TRT → eager toggle) and by the LoRA
+        refit when reading scaled weights — moving back to GPU lets
+        ``fuse_lora`` run at full speed.
+        """
+        eager = getattr(self.pipe.pipe, "unet", None)
+        if eager is None:
+            return
+        try:
+            first_param = next(eager.parameters(), None)
+        except StopIteration:
+            first_param = None
+        if first_param is None or first_param.device.type == "cuda":
+            return
+        try:
+            eager.to(self.device)
+        except Exception as e:
+            print(f"[TRT] failed to restore eager UNet to GPU: {e}")
+
+    def _offload_eager_controlnet_to_cpu(self) -> None:
+        """Park the diffusers ControlNet on CPU after the TRT CN engine is live.
+
+        SDXL ControlNet is ~3 GB fp16; kept only for the
+        ``acceleration_mode='none'`` toggle. Same trade as the UNet
+        offload — round-trip on demand.
+        """
+        cn_handler = getattr(self.pipe, "_cn", None)
+        cn_model = getattr(cn_handler, "model", None) if cn_handler is not None else None
+        if cn_model is None:
+            return
+        try:
+            first_param = next(cn_model.parameters(), None)
+        except StopIteration:
+            first_param = None
+        if first_param is None or first_param.device.type == "cpu":
+            return
+        try:
+            cn_model.to("cpu")
+            torch.cuda.empty_cache()
+            print("[TRT] eager ControlNet offloaded to CPU", flush=True)
+        except Exception as e:
+            print(f"[TRT] failed to offload eager ControlNet to CPU: {e}")
+
+    def _restore_eager_controlnet_to_gpu(self) -> None:
+        cn_handler = getattr(self.pipe, "_cn", None)
+        cn_model = getattr(cn_handler, "model", None) if cn_handler is not None else None
+        if cn_model is None:
+            return
+        try:
+            first_param = next(cn_model.parameters(), None)
+        except StopIteration:
+            first_param = None
+        if first_param is None or first_param.device.type == "cuda":
+            return
+        try:
+            cn_model.to(self.device)
+        except Exception as e:
+            print(f"[TRT] failed to restore eager ControlNet to GPU: {e}")
+
+    def _sync_refit_to_eager(self) -> None:
+        """Refit the live engine to match the current eager UNet weights.
+
+        Engines restored from cache (in-memory or on-disk) may have been
+        built / last-refitted at a different scale than the live eager
+        UNet's fused state. Push the current state in. No-op when no
+        ``_refit_ctx`` is attached (engine wasn't built refittable).
+        """
+        adapter = getattr(self.pipe, "unet", None)
+        ctx = getattr(adapter, "_refit_ctx", None)
+        if ctx is None:
+            return
+        if self.try_refit_unet_lora_scales():
+            print("[LoRA refit] synced cached engine to current eager UNet scales")
+
+    def try_refit_unet_lora_scales(self) -> bool:
+        """Attempt an in-place engine refit reflecting the current eager UNet.
+
+        Caller is expected to have already updated the eager UNet (e.g.
+        via ``apply_loras`` with new scales). Returns True if the live
+        TRT engine was refitted; False if refit is unavailable / failed
+        and the caller should fall back to a full rebuild.
+
+        Round-trips the eager UNet through GPU when it's offloaded to CPU
+        (the post-build VRAM saver). ``fuse_lora`` and ``state_dict``
+        reads run on whichever device the modules are on; GPU is ~10×
+        faster than CPU for the fuse step, which dominates refit time
+        when LoRAs are present.
+        """
+        adapter = getattr(self.pipe, "unet", None)
+        ctx = getattr(adapter, "_refit_ctx", None)
+        if ctx is None:
+            return False
+        # Eager UNet may have been swapped out and back in; re-bind the
+        # latest reference so we read fresh post-fuse_lora weights.
+        ctx.eager_unet = self.pipe.pipe.unet
+        self._restore_eager_unet_to_gpu()
+        try:
+            from .lora_refit import refit_unet_lora_scales
+            return refit_unet_lora_scales(ctx)
+        finally:
+            self._offload_eager_unet_to_cpu()

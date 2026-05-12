@@ -3,13 +3,35 @@
 from enum import IntEnum, StrEnum
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     InputMode,
     ModeDefaults,
     ui_field_config,
 )
+
+
+class LoraSpec(BaseModel):
+    """One LoRA adapter loaded into the diffusion pipeline.
+
+    Path is the source of truth (matches Scope's library convention —
+    files under ``models/lora/`` are listed by ``/api/v1/loras`` and the
+    picker emits the local path). ``id`` is the frontend-assigned UUID
+    used by the picker; we don't read it but accept it so the schema
+    round-trips unchanged. ``merge_mode`` per-LoRA is accepted but
+    currently ignored — strategy is global via ``lora_merge_strategy``.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    path: str = Field(description="Local path to the LoRA file (.safetensors)")
+    scale: float = Field(default=1.0, ge=0.0, le=2.0, description="Adapter weight")
+    id: str | None = Field(default=None, description="Frontend picker UUID")
+    merge_mode: str | None = Field(
+        default=None, alias="mergeMode",
+        description="Per-LoRA merge mode (currently ignored — global strategy wins)",
+    )
 
 
 class ModelId(StrEnum):
@@ -64,10 +86,16 @@ class StreamDiffusionConfig(BasePipelineConfig):
 
     supports_lora = True
 
-    # Accept a mask stream from upstream segmenters (YOLO mask, SAM3 mask, etc.)
-    # in addition to video. Mask is (1, 1, F, H, W) binary; compositing happens
-    # post-SD per the mask_compositing field below.
-    inputs = ["video", "vace_input_masks"]
+    # Input ports the host (moth / scope) exposes as wireable. ``video`` is
+    # the SD-styled input. The remaining ports are optional, related to
+    # mask compositing:
+    #
+    #   * ``vace_input_masks`` — binary mask from an upstream segmenter
+    #     (yolo_mask, scope-sam3). Shape (1, 1, F, H, W).
+    #   * ``vace_input_frames`` — pristine-outside-mask source frame in
+    #     [-1, 1] VAE space, emitted alongside ``vace_input_masks`` by the
+    #     standard segmenters. Preferred background for ``mask_compositing``.
+    inputs = ["video", "vace_input_masks", "vace_input_frames"]
 
     # ========================================
     # Pipeline Control
@@ -103,19 +131,16 @@ class StreamDiffusionConfig(BasePipelineConfig):
     acceleration_mode: Literal["none", "trt"] = Field(
         default="trt",
         description=(
-            "TRT-compile UNet (and ControlNet on SD 1.5) for 2-8x denoising "
-            "speedup. First build per model takes 5-10 min and caches to "
+            "TRT-compile UNet and ControlNet for 2-8x denoising speedup. "
+            "First build per model takes 5-10 min and caches to "
             "~/.cache/scope-streamdiffusion-trt/. Hot-swappable at runtime: "
             "toggling restores cached engines from process-scope cache "
             "(instant) or builds them on first activation (stalls the "
             "stream). SD 1.5 engines support dynamic resolution 256-1024 "
             "and batch 1-4. SDXL engines (sdxl-turbo, dmd2-sdxl-1step) "
             "support dynamic resolution 512-1024 with static batch=1 — "
-            "different envelope to fit a 24 GB VRAM build budget. SDXL "
-            "ControlNet works in eager mode (acceleration_mode='none'); "
-            "SDXL + ControlNet + TRT is not yet supported (raises "
-            "NotImplementedError) — flip acceleration off when using "
-            "ControlNet on SDXL until that lands."
+            "different envelope to fit a 24 GB VRAM build budget. SDXL + "
+            "ControlNet + TRT is supported on both SD 1.5 and SDXL hosts."
         ),
         json_schema_extra=ui_field_config(order=2, label="Acceleration"),
     )
@@ -183,6 +208,51 @@ class StreamDiffusionConfig(BasePipelineConfig):
         description="Temporal blending of the ControlNet conditioning map. 0.0 = fully smoothed (previous frame only), 1.0 = no smoothing (current frame only). Lower values reduce flicker; higher values reduce latency.",
         #json_schema_extra=ui_field_config(order=5, label="ControlNet Smoothing"),
     )
+
+    # ========================================
+    # LoRA
+    # ========================================
+
+    lora_merge_strategy: Literal["permanent_merge", "runtime_peft"] = Field(
+        default="runtime_peft",
+        description=(
+            "How LoRAs combine with base UNet weights. 'runtime_peft' keeps "
+            "adapters live so scales can change per frame (~free). "
+            "'permanent_merge' fuses weights into the UNet — slightly faster "
+            "inference, but every LoRA stack/scale change reloads the model. "
+            "TRT compiles fused weights, so on TRT only 'permanent_merge' is "
+            "honored (a runtime_peft scale change forces an engine rebuild)."
+        ),
+        json_schema_extra=ui_field_config(order=6, component="lora", label="LoRA Strategy"),
+    )
+
+    loras: list[LoraSpec] = Field(
+        default_factory=list,
+        description=(
+            "LoRA adapters to load. Populated by the LoRA picker (when the "
+            "host UI provides one) or by the project file's load_params. "
+            "Marked as a load_param so it doesn't appear as a raw text input "
+            "in hosts that lack an array control."
+        ),
+        json_schema_extra=ui_field_config(order=7, component="lora", is_load_param=True, label="LoRAs"),
+    )
+
+    @field_validator("loras", mode="before")
+    @classmethod
+    def _coerce_loras(cls, v: object) -> object:
+        # Hosts without an array control may serialize loras as a JSON string
+        # in a text input (or send None when cleared). Accept both shapes so
+        # the picker contract isn't the only viable path.
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"loras must be a JSON list of {{path, scale}} objects; got {v!r}") from e
+            return parsed if isinstance(parsed, list) else [parsed]
+        return v
 
     # ========================================
     # Generation Parameters
