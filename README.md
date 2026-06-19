@@ -1,5 +1,7 @@
 # StreamDiffusion Plugin for Daydream Scope
 
+[![Available on Daydream](https://img.shields.io/badge/Daydream-Install_Node-FF6B35)](https://app.daydream.live/nodes/happyFish/stream-diffusion-v1)
+
 This plugin integrates StreamDiffusion into Daydream Scope for real-time Stable Diffusion video generation.
 
 ## Features
